@@ -1,7 +1,7 @@
 import streamlit as st
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
-    RunReportRequest, DateRange, Metric, Dimension, FilterExpression, Filter, StringFilter
+    RunReportRequest, DateRange, Metric, Dimension
 )
 from datetime import datetime, timedelta
 import json
@@ -18,7 +18,7 @@ now = datetime.now(JST)
 current_hour = now.hour
 
 # ---------------------------------------------------------
-# 1. 認証 (Streamlit CloudのSecretsを使う)
+# 1. 認証
 # ---------------------------------------------------------
 try:
     creds_json = json.loads(st.secrets["gcp_service_account"])
@@ -40,6 +40,7 @@ BLOGS = [
 # 3. データ取得関数群
 # ---------------------------------------------------------
 def get_realtime_metrics(property_id):
+    # A. 今日の累計
     req_today = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date="today", end_date="today")],
@@ -48,6 +49,7 @@ def get_realtime_metrics(property_id):
     res_today = client.run_report(req_today)
     pv_today = int(res_today.rows[0].metric_values[0].value) if res_today.rows else 0
 
+    # B. 昨日の同時刻データ
     req_yest = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date="yesterday", end_date="yesterday")],
@@ -84,23 +86,22 @@ def get_search_keywords(property_id, days):
         for row in response.rows:
             word = row.dimension_values[0].value
             pv = int(row.metric_values[0].value)
-            if word and word != "(not set)" and word != "(not provided)":
+            # ノイズ除去
+            if word and word not in ["(not set)", "(not provided)"]:
                 data.append({"キーワード": word, "PV": pv})
     
     return pd.DataFrame(data)
 
 def get_organic_trend(property_id):
+    """
+    検索流入の推移を取得（API側でフィルタせず、Python側で抽出する方式に変更）
+    """
     request = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
-        dimensions=[Dimension(name="date")],
+        # 日付とチャネル（流入元）を取得
+        dimensions=[Dimension(name="date"), Dimension(name="sessionDefaultChannelGroup")],
         metrics=[Metric(name="screenPageViews")],
-        filter=FilterExpression(
-            filter=Filter(
-                field_name="sessionDefaultChannelGroup",
-                string_filter=StringFilter(value="Organic Search")
-            )
-        ),
         order_bys=[{"dimension": {"dimension_name": "date"}}]
     )
     response = client.run_report(request)
@@ -109,13 +110,19 @@ def get_organic_trend(property_id):
     if response.rows:
         for row in response.rows:
             date_str = row.dimension_values[0].value
+            channel = row.dimension_values[1].value # 流入元
             pv = int(row.metric_values[0].value)
-            dt = datetime.strptime(date_str, "%Y%m%d")
-            data.append({"日付": dt, "検索流入PV": pv})
+            
+            # ここで「Organic Search」だけを拾う（Python側で処理）
+            if channel == "Organic Search":
+                dt = datetime.strptime(date_str, "%Y%m%d")
+                data.append({"日付": dt, "検索流入PV": pv})
             
     df = pd.DataFrame(data)
+    # 日付ごとの合計を再集計（念のため）
     if not df.empty:
-        df = df.set_index("日付")
+        df = df.groupby("日付").sum()
+        
     return df
 
 # ---------------------------------------------------------
@@ -125,6 +132,7 @@ st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 tab1, tab2 = st.tabs(["⏱️ リアルタイムPV", "🔍 検索ワード分析"])
 
+# --- タブ1 ---
 with tab1:
     cols = st.columns(3)
     for i, blog in enumerate(BLOGS):
@@ -142,6 +150,7 @@ with tab1:
     if st.button("更新", key="refresh_realtime"):
         st.rerun()
 
+# --- タブ2 ---
 with tab2:
     st.markdown("### 🔍 検索流入レポート")
     for blog in BLOGS:
@@ -152,7 +161,7 @@ with tab2:
                 if not trend_df.empty:
                     st.line_chart(trend_df, color="#FF4B4B")
                 else:
-                    st.info("データがありません")
+                    st.info("データがありません（または検索流入ゼロ）")
             except Exception as e:
                 st.error(f"グラフ取得エラー: {e}")
 

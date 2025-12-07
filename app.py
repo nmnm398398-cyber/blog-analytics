@@ -1,13 +1,14 @@
 import streamlit as st
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
-    RunReportRequest, DateRange, Metric, Dimension, FilterExpression, Filter, StringFilter
+    RunReportRequest, DateRange, Metric, Dimension
 )
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 import pytz
 import pandas as pd
 import urllib.parse
+import re
 
 # ---------------------------------------------------------
 # 0. ページ設定 & パスワード認証
@@ -52,14 +53,14 @@ except Exception as e:
     st.stop()
 
 # ---------------------------------------------------------
-# 2. ブログ設定 (URLを追加しました)
+# 2. ブログ設定
 # ---------------------------------------------------------
+# ※ ここにご自身のブログURLを入れてください
 BLOGS = [
-    {"name": "🚙 ジムニーフリーク！", "id": "470121869", "url": "jimny-freak.com"}, # ドメインの一部でOK
+    {"name": "🚙 ジムニーフリーク！", "id": "470121869", "url": "jimny-freak.com"}, 
     {"name": "🎣 ソルトルアーのすすめ！", "id": "343862616", "url": "salt-lure.com"},
     {"name": "👔 公務員転職マン", "id": "445135719", "url": "koumuin-tenshoku.com"},
 ]
-# ※ ご自身の正しいドメイン（URLの一部）に書き換えてください。検索に使います。
 
 # ---------------------------------------------------------
 # 3. データ取得ロジック
@@ -95,7 +96,7 @@ def get_realtime_metrics(property_id):
                 
     return pv_today, pv_yest_same, pv_yest_total
 
-# ② 日別推移グラフ用データ
+# ② 日別推移グラフ
 def get_daily_trend_comparison(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
@@ -133,7 +134,7 @@ def get_daily_trend_comparison(property_id, days):
     
     return df, sum(curr_data), sum(prev_data)
 
-# ③ 記事ランキング (自動回避版)
+# ③ 記事ランキング (エラー回避版)
 def get_article_ranking_comparison(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
@@ -152,7 +153,7 @@ def get_article_ranking_comparison(property_id, days):
             limit=2000
         )
         res_curr = client.run_report(req_curr)
-        valid_kw_count = 0
+        valid_kw = 0
         if res_curr.rows:
             for row in res_curr.rows:
                 title = row.dimension_values[0].value
@@ -162,10 +163,10 @@ def get_article_ranking_comparison(property_id, days):
                 clean_kw = ""
                 if kw and kw not in ["(not set)", "(not provided)"]:
                     clean_kw = kw
-                    valid_kw_count += 1
+                    valid_kw += 1
                 if title and title != "(not set)":
                     raw_data.append({"title": title, "kw": clean_kw, "pv": pv, "rank": rank})
-        if valid_kw_count == 0: raise ValueError("No valid keywords")
+        if valid_kw == 0: raise ValueError("No keywords")
 
     except Exception:
         is_keyword_available = False
@@ -260,49 +261,44 @@ def get_article_ranking_comparison(property_id, days):
     final = final[["title", "今期のPV", "前期のPV", "前期間比", col_name]].rename(columns={"title": "記事タイトル"})
     return final
 
-# ④ SNS流入分析 (新機能)
-def get_sns_traffic(property_id, days=7):
+# ④ SNS流入分析 (Pythonフィルタ版 - エラー回避)
+def get_sns_traffic_safe(property_id, days=7):
     """
-    SNSからの流入に絞ってデータを取得する
+    GA4 API側でフィルタせず、全データを取得してからPython側でSNSを抽出する
+    （FilterExpressionによるImportErrorを回避するため）
     """
     start_date = f"{days}daysAgo"
     
-    # 主要SNSのフィルタリング (正規表現)
-    # t.co=Twitter, facebook, instagram, linkedin, pinterest, youtube, threads
-    sns_regex = r"t\.co|twitter|facebook|instagram|linkedin|pinterest|youtube|threads"
-    
+    # 全流入元を取得
     request = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date=start_date, end_date="today")],
         dimensions=[Dimension(name="sessionSource"), Dimension(name="pageTitle")],
         metrics=[Metric(name="screenPageViews")],
-        filter=FilterExpression(
-            filter=Filter(
-                field_name="sessionSource",
-                string_filter=StringFilter(
-                    match_type="PARTIAL_REGEXP",
-                    value=sns_regex
-                )
-            )
-        )
+        limit=5000
     )
     response = client.run_report(request)
     
     data = []
+    # SNS判定用正規表現
+    sns_pattern = re.compile(r"t\.co|twitter|facebook|instagram|linkedin|pinterest|youtube|threads", re.IGNORECASE)
+    
     if response.rows:
         for row in response.rows:
             source = row.dimension_values[0].value
             title = row.dimension_values[1].value
             pv = int(row.metric_values[0].value)
             
-            # ソース名の見栄えを良くする
-            if "t.co" in source or "twitter" in source: source_label = "X (Twitter)"
-            elif "facebook" in source: source_label = "Facebook"
-            elif "instagram" in source: source_label = "Instagram"
-            elif "threads" in source: source_label = "Threads"
-            else: source_label = source
-            
-            data.append({"SNS": source_label, "記事タイトル": title, "PV": pv})
+            # Python側で判定
+            if sns_pattern.search(source):
+                # 表示名の整形
+                label = source
+                if "t.co" in source or "twitter" in source: label = "X (Twitter)"
+                elif "facebook" in source: label = "Facebook"
+                elif "instagram" in source: label = "Instagram"
+                elif "threads" in source: label = "Threads"
+                
+                data.append({"SNS": label, "記事タイトル": title, "PV": pv})
             
     return pd.DataFrame(data)
 
@@ -313,7 +309,6 @@ st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 tab1, tab2, tab3 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入"])
 
-# --- タブ1: リアルタイム ---
 with tab1:
     cols = st.columns(3)
     for i, blog in enumerate(BLOGS):
@@ -330,7 +325,6 @@ with tab1:
     if st.button("更新", key="refresh_realtime"):
         st.rerun()
 
-# --- タブ2: 期間分析 ---
 with tab2:
     st.markdown("### 📈 期間比較レポート")
     col_sel, _ = st.columns([1, 2])
@@ -358,51 +352,35 @@ with tab2:
             except Exception as e:
                 st.error(f"エラー: {e}")
 
-# --- タブ3: SNS言及・流入 (New!) ---
 with tab3:
     st.markdown("### 📱 SNS流入 & エゴサーチ")
     st.caption("過去7日間にSNS（X, FB, Insta等）から流入があった記事と、SNS上の反応を確認します。")
     
     for blog in BLOGS:
         with st.expander(f"💬 {blog['name']}", expanded=True):
-            
-            # 1. GA4によるSNS流入データ
             try:
-                df_sns = get_sns_traffic(blog["id"], 7) # 過去7日間
+                # 修正した safe 関数を使用
+                df_sns = get_sns_traffic_safe(blog["id"], 7)
                 if not df_sns.empty:
-                    total_sns_pv = df_sns["PV"].sum()
-                    st.metric("SNS経由の総PV (過去7日)", f"{total_sns_pv} PV")
-                    
-                    # 内訳グラフ
+                    total_sns = df_sns["PV"].sum()
+                    st.metric("SNS経由の総PV (過去7日)", f"{total_sns} PV")
                     chart_data = df_sns.groupby("SNS")["PV"].sum()
                     st.bar_chart(chart_data, color="#1DA1F2")
-                    
-                    # 詳細テーブル
                     st.markdown("**📌 SNSで話題になった記事**")
                     st.dataframe(df_sns, use_container_width=True, hide_index=True)
                 else:
-                    st.info("過去7日間、SNSからの流入（クリック）はありませんでした。")
-            
+                    st.info("SNSからの流入はまだありません。")
             except Exception as e:
                 st.error(f"データ取得エラー: {e}")
 
             st.markdown("---")
-            
-            # 2. エゴサーチボタン (Yahooリアルタイム検索などへのリンク)
             st.markdown("**🔎 実際の投稿を探す (エゴサーチ)**")
-            st.caption("ボタンを押すと、Yahoo!リアルタイム検索（Xの投稿検索）などの結果ページを開きます。")
-            
-            # 検索用URL生成 (ドメイン名で検索)
-            # 例: "jimny-freak.com" を含むツイートを検索
-            search_query = urllib.parse.quote(blog.get("url", "")) # 設定にurlがない場合は空
-            
+            search_query = urllib.parse.quote(blog.get("url", "")) 
             if search_query:
-                col_btn1, col_btn2 = st.columns(2)
-                with col_btn1:
-                    yahoo_url = f"https://search.yahoo.co.jp/realtime/search?p={search_query}"
-                    st.link_button("X(Twitter)の反応を見る (Yahooリアルタイム)", yahoo_url)
-                with col_btn2:
-                    google_url = f"https://www.google.com/search?q=site:x.com+{search_query}+OR+site:facebook.com+{search_query}"
-                    st.link_button("SNS全体をGoogle検索", google_url)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.link_button("X(Twitter)の反応を見る", f"https://search.yahoo.co.jp/realtime/search?p={search_query}")
+                with c2:
+                    st.link_button("SNS全体をGoogle検索", f"https://www.google.com/search?q=site:x.com+{search_query}+OR+site:facebook.com+{search_query}")
             else:
-                st.warning("※コード内のBLOGS設定に 'url' を追加してください")
+                st.warning("設定(BLOGS)にurlを入れてください")

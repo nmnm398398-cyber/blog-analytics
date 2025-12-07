@@ -53,7 +53,7 @@ except Exception as e:
     st.stop()
 
 # ---------------------------------------------------------
-# 2. ブログ設定 (正しいURLを反映しました)
+# 2. ブログ設定
 # ---------------------------------------------------------
 BLOGS = [
     {"name": "🚙 ジムニーフリーク！", "id": "470121869", "url": "jimm.hateblo.jp"}, 
@@ -260,43 +260,48 @@ def get_article_ranking_comparison(property_id, days):
     final = final[["title", "今期のPV", "前期のPV", "前期間比", col_name]].rename(columns={"title": "記事タイトル"})
     return final
 
-# ④ SNS流入分析 (Pythonフィルタ版 - エラー回避)
-def get_sns_traffic_safe(property_id, days=7):
-    """
-    GA4 API側でフィルタせず、全データを取得してからPython側でSNSを抽出する
-    """
+# ④ SNS流入分析 (リンク生成機能付き)
+def get_sns_traffic_safe(property_id, domain, days=7):
     start_date = f"{days}daysAgo"
     
-    # 全流入元を取得
+    # pagePathも取得して正確なURLを検索できるようにする
     request = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date=start_date, end_date="today")],
-        dimensions=[Dimension(name="sessionSource"), Dimension(name="pageTitle")],
+        dimensions=[Dimension(name="sessionSource"), Dimension(name="pageTitle"), Dimension(name="pagePath")],
         metrics=[Metric(name="screenPageViews")],
         limit=5000
     )
     response = client.run_report(request)
     
     data = []
-    # SNS判定用正規表現
     sns_pattern = re.compile(r"t\.co|twitter|facebook|instagram|linkedin|pinterest|youtube|threads", re.IGNORECASE)
     
     if response.rows:
         for row in response.rows:
             source = row.dimension_values[0].value
             title = row.dimension_values[1].value
+            path = row.dimension_values[2].value
             pv = int(row.metric_values[0].value)
             
-            # Python側で判定
             if sns_pattern.search(source):
-                # 表示名の整形
                 label = source
                 if "t.co" in source or "twitter" in source: label = "X (Twitter)"
                 elif "facebook" in source: label = "Facebook"
                 elif "instagram" in source: label = "Instagram"
                 elif "threads" in source: label = "Threads"
                 
-                data.append({"SNS": label, "記事タイトル": title, "PV": pv})
+                # Yahooリアルタイム検索用のURLを生成
+                # ドメイン + パス で検索するのが最も確実
+                full_url = f"{domain}{path}"
+                search_url = f"https://search.yahoo.co.jp/realtime/search?p={urllib.parse.quote(full_url)}"
+                
+                data.append({
+                    "SNS": label, 
+                    "記事タイトル": title, 
+                    "PV": pv,
+                    "search_link": search_url # 隠し列（LinkColumn用）
+                })
             
     return pd.DataFrame(data)
 
@@ -357,22 +362,34 @@ with tab3:
     for blog in BLOGS:
         with st.expander(f"💬 {blog['name']}", expanded=True):
             try:
-                # 修正した safe 関数を使用
-                df_sns = get_sns_traffic_safe(blog["id"], 7)
+                df_sns = get_sns_traffic_safe(blog["id"], blog["url"], 7)
                 if not df_sns.empty:
                     total_sns = df_sns["PV"].sum()
                     st.metric("SNS経由の総PV (過去7日)", f"{total_sns} PV")
                     chart_data = df_sns.groupby("SNS")["PV"].sum()
                     st.bar_chart(chart_data, color="#1DA1F2")
+                    
                     st.markdown("**📌 SNSで話題になった記事**")
-                    st.dataframe(df_sns, use_container_width=True, hide_index=True)
+                    # LinkColumnを使って「確認」ボタンを表示
+                    st.dataframe(
+                        df_sns,
+                        column_config={
+                            "search_link": st.column_config.LinkColumn(
+                                "投稿を確認", 
+                                display_text="検索 🔎",
+                                help="Yahoo!リアルタイム検索でこの記事のURLを含む投稿を探します"
+                            )
+                        },
+                        use_container_width=True, 
+                        hide_index=True
+                    )
                 else:
                     st.info("SNSからの流入はまだありません。")
             except Exception as e:
                 st.error(f"データ取得エラー: {e}")
 
             st.markdown("---")
-            st.markdown("**🔎 実際の投稿を探す (エゴサーチ)**")
+            st.markdown("**🔎 ブログ全体をエゴサーチ**")
             search_query = urllib.parse.quote(blog.get("url", "")) 
             if search_query:
                 c1, c2 = st.columns(2)
@@ -380,5 +397,3 @@ with tab3:
                     st.link_button("X(Twitter)の反応を見る", f"https://search.yahoo.co.jp/realtime/search?p={search_query}")
                 with c2:
                     st.link_button("SNS全体をGoogle検索", f"https://www.google.com/search?q=site:x.com+{search_query}+OR+site:facebook.com+{search_query}")
-            else:
-                st.warning("設定(BLOGS)にurlを入れてください")

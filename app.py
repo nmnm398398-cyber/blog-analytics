@@ -131,17 +131,19 @@ def get_daily_trend_comparison(property_id, days):
     
     return df, sum(curr_data), sum(prev_data)
 
-# ③ 記事ランキング比較 (検索順位対応版)
+# ③ 記事ランキング比較 (データなし自動回避・完全版)
 def get_article_ranking_comparison(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
     prev_start = f"{days*2}daysAgo"
     prev_end = f"{days+1}daysAgo"
 
-    # --- A. 今期のデータ (順位取得に挑戦) ---
+    # --- A. 今期のデータ (キーワード取得に挑戦) ---
     is_keyword_available = True
+    raw_data = []
+
     try:
-        # dimensionsに検索キーワードを追加、metricsに平均掲載順位を追加
+        # トライ: キーワードと順位を取得
         req_curr = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
@@ -151,26 +153,31 @@ def get_article_ranking_comparison(property_id, days):
         )
         res_curr = client.run_report(req_curr)
         
-        raw_data = []
+        valid_kw_count = 0
         if res_curr.rows:
             for row in res_curr.rows:
                 title = row.dimension_values[0].value
                 kw = row.dimension_values[1].value
                 pv = int(row.metric_values[0].value)
-                # 順位 (APIが返すのはfloatですが文字列の場合もあるため変換)
                 rank = float(row.metric_values[1].value)
                 
+                clean_kw = ""
+                if kw and kw not in ["(not set)", "(not provided)"]:
+                    clean_kw = kw
+                    valid_kw_count += 1
+                
                 if title and title != "(not set)":
-                    clean_kw = kw if kw and kw not in ["(not set)", "(not provided)"] else ""
-                    if clean_kw:
-                        raw_data.append({"title": title, "kw": clean_kw, "pv": pv, "rank": rank})
-                    else:
-                        # キーワード不明でもPVカウントのために追加
-                        raw_data.append({"title": title, "kw": "", "pv": pv, "rank": 0})
+                    raw_data.append({"title": title, "kw": clean_kw, "pv": pv, "rank": rank})
+        
+        # ★ここが重要: エラーは出なくても「有効なキーワードが0個」なら失敗とみなす
+        if valid_kw_count == 0:
+            raise ValueError("No valid keywords found")
 
     except Exception:
-        # GSC未連携などで順位が取れない場合のフォールバック
+        # 失敗したら「流入元」取得モードに切り替え
         is_keyword_available = False
+        raw_data = [] # リセット
+        
         req_fb = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
@@ -179,11 +186,10 @@ def get_article_ranking_comparison(property_id, days):
             limit=1000
         )
         res_fb = client.run_report(req_fb)
-        raw_data = []
         if res_fb.rows:
             for row in res_fb.rows:
                 title = row.dimension_values[0].value
-                info = row.dimension_values[1].value
+                info = row.dimension_values[1].value # source / medium
                 pv = int(row.metric_values[0].value)
                 if title and title != "(not set)":
                     raw_data.append({"title": title, "kw": info, "pv": pv, "rank": 0})
@@ -191,8 +197,8 @@ def get_article_ranking_comparison(property_id, days):
     df_curr = pd.DataFrame(raw_data)
     if df_curr.empty: return pd.DataFrame()
 
-    # --- B. 前期の順位データ取得 (キーワード順位比較用) ---
-    prev_rank_map = {} # {(title, kw): rank} の辞書を作る
+    # --- B. 前期の順位データ (比較用) ---
+    prev_rank_map = {}
     if is_keyword_available:
         try:
             req_prev = RunReportRequest(
@@ -210,9 +216,9 @@ def get_article_ranking_comparison(property_id, days):
                     r = float(row.metric_values[0].value)
                     prev_rank_map[(t, k)] = r
         except:
-            pass # 前期データ取得失敗時は比較なし
+            pass
 
-    # --- C. 前期のPVデータ取得 (記事PV比較用) ---
+    # --- C. 前期のPVデータ ---
     req_prev_pv = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date=prev_start, end_date=prev_end)],
@@ -226,64 +232,55 @@ def get_article_ranking_comparison(property_id, days):
         for row in res_prev_pv.rows:
             prev_pv_map[row.dimension_values[0].value] = int(row.metric_values[0].value)
 
-    # --- D. 集計と整形 ---
-    
-    # 1. 記事ごとのPV合計
+    # --- D. 集計と表示整形 ---
     df_grouped = df_curr.groupby("title")["pv"].sum().reset_index().rename(columns={"pv": "今期のPV"})
-    
-    # 2. 前期PVとの結合
     df_grouped["前期のPV"] = df_grouped["title"].map(prev_pv_map).fillna(0).astype(int)
-    df_grouped["差分"] = df_grouped["今期のPV"] - df_grouped["前期のPV"]
     
+    # PV差分率
+    df_grouped["差分"] = df_grouped["今期のPV"] - df_grouped["前期のPV"]
     def calc_pct(row):
         if row["前期のPV"] > 0: return f"{(row['差分'] / row['前期のPV'] * 100):+.1f}%"
         elif row["今期のPV"] > 0: return "NEW"
         else: return "0%"
     df_grouped["前期間比"] = df_grouped.apply(calc_pct, axis=1)
 
-    # 3. キーワード情報の整形 (順位・比較付き)
-    # 記事ごとに、PVが多い順にキーワードを抽出
-    def format_keyword_info(title):
-        if not is_keyword_available:
-            # フォールバック時（流入元表示）
-            infos = df_curr[df_curr["title"] == title]["kw"].head(3).tolist()
-            return ", ".join(infos) if infos else "-"
+    # 情報カラムの整形
+    def format_info(title):
+        # 該当記事のデータを取得
+        rows = df_curr[df_curr["title"] == title]
         
-        # 該当記事のキーワードデータをPV順に取得
-        kws = df_curr[df_curr["title"] == title]
-        # 空文字キーワードを除外
-        kws = kws[kws["kw"] != ""].sort_values("pv", ascending=False).head(3)
-        
-        result_strs = []
-        for _, row in kws.iterrows():
-            kw = row["kw"]
-            curr_rank = row["rank"]
-            prev_rank = prev_rank_map.get((title, kw), 0)
+        # キーワードモードの場合
+        if is_keyword_available:
+            # キーワードがあるものだけ抽出してPV順に
+            kws = rows[rows["kw"] != ""].sort_values("pv", ascending=False).head(3)
+            if kws.empty: return "-"
             
-            # 順位表示のロジック
-            rank_str = f"{curr_rank:.1f}位"
-            
-            if prev_rank > 0:
-                diff = prev_rank - curr_rank # プラスなら順位上昇(改善)
-                if diff > 0:
-                    # 順位が上がった(良くなった)
-                    rank_str += f" (⬆{diff:.1f})"
-                elif diff < 0:
-                    # 順位が下がった(悪くなった)
-                    rank_str += f" (⬇{abs(diff):.1f})"
-                else:
-                    rank_str += " (➡)"
-            else:
-                rank_str += " (NEW)"
+            res = []
+            for _, r in kws.iterrows():
+                kw = r["kw"]
+                cr = r["rank"]
+                pr = prev_rank_map.get((title, kw), 0)
                 
-            result_strs.append(f"{kw}: {rank_str}")
+                rank_str = f"{cr:.1f}位"
+                if pr > 0:
+                    diff = pr - cr
+                    if diff > 0: rank_str += f" (⬆{diff:.1f})"
+                    elif diff < 0: rank_str += f" (⬇{abs(diff):.1f})"
+                    else: rank_str += " (➡)"
+                else:
+                    rank_str += " (NEW)"
+                res.append(f"{kw}: {rank_str}")
+            return " | ".join(res)
             
-        return " | ".join(result_strs) if result_strs else "-"
+        # 流入元モードの場合 (キーワードが無い時)
+        else:
+            # PV順に流入元を並べる
+            sources = rows.groupby("kw")["pv"].sum().reset_index().sort_values("pv", ascending=False).head(3)
+            return ", ".join(sources["kw"].tolist())
 
-    col_name = "流入KWと検索順位(TOP3)" if is_keyword_available else "主な流入元"
-    df_grouped[col_name] = df_grouped["title"].apply(format_keyword_info)
+    col_name = "検索キーワード(TOP3)" if is_keyword_available else "主な流入元(TOP3)"
+    df_grouped[col_name] = df_grouped["title"].apply(format_info)
 
-    # ソート
     final = df_grouped.sort_values("今期のPV", ascending=False).head(30)
     final = final[["title", "今期のPV", "前期のPV", "前期間比", col_name]]
     final = final.rename(columns={"title": "記事タイトル"})
@@ -318,7 +315,6 @@ with tab2:
     
     col_sel, _ = st.columns([1, 2])
     with col_sel:
-        # デフォルトをindex=0 (7日間) に変更しました
         period_days = st.selectbox(
             "分析期間", [7, 30], index=0, 
             format_func=lambda x: f"過去 {x} 日間 vs その前の {x} 日間"
@@ -338,8 +334,7 @@ with tab2:
 
                 df_top = get_article_ranking_comparison(blog["id"], period_days)
                 if not df_top.empty:
-                    st.markdown("#### 🏆 記事別ランキング TOP30 (検索順位付き)")
-                    st.caption("順位の見方: キーワード: 今期の平均順位 (⬆=順位上昇/改善, ⬇=順位下落)")
+                    st.markdown("#### 🏆 記事別ランキング TOP30")
                     st.dataframe(
                         df_top, 
                         use_container_width=True, 

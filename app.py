@@ -19,27 +19,21 @@ def check_password():
         st.session_state.authenticated = False
 
     if not st.session_state.authenticated:
-        # ログイン画面の表示
         st.title("🔒 ログイン")
         password_input = st.text_input("パスワードを入力してください", type="password")
         
         if st.button("ログイン"):
-            # Secretsに設定したパスワードと照合
             if password_input == st.secrets["auth"]["password"]:
                 st.session_state.authenticated = True
-                st.rerun() # 画面を再読み込みしてメイン処理へ
+                st.rerun()
             else:
                 st.error("パスワードが違います")
-        
-        # 認証されていない場合はここで処理を強制終了
         st.stop()
 
-# 認証チェックを実行 (ここを通らないと下には進めない)
 check_password()
 
-
 # =========================================================
-#  ここから下は認証成功後にしか実行されません
+#  メイン処理
 # =========================================================
 
 st.title("📊 ブログ分析ダッシュボード Pro")
@@ -103,6 +97,10 @@ def get_realtime_metrics(property_id):
 
 def get_top_pages_with_keywords(property_id, days):
     start_date = f"{days}daysAgo"
+    
+    # -------------------------------------------------
+    # 戦略A: 検索キーワードの取得に挑戦
+    # -------------------------------------------------
     try:
         request = RunReportRequest(
             property=f"properties/{property_id}",
@@ -121,40 +119,58 @@ def get_top_pages_with_keywords(property_id, days):
                 pv = int(row.metric_values[0].value)
                 if title and title != "(not set)":
                     clean_kw = kw if kw and kw not in ["(not set)", "(not provided)"] else ""
-                    raw_data.append({"title": title, "kw": clean_kw, "pv": pv})
+                    raw_data.append({"title": title, "info": clean_kw, "pv": pv})
         
-        df_raw = pd.DataFrame(raw_data)
-        if df_raw.empty: return pd.DataFrame()
-
-        pv_sum = df_raw.groupby("title")["pv"].sum().reset_index().sort_values("pv", ascending=False)
-        kw_data = df_raw[df_raw["kw"] != ""].sort_values("pv", ascending=False)
+        # データ加工へ（下部で共通処理）
+        info_label = "検索キーワード(TOP3)"
         
-        def get_top_kws(title):
-            kws = kw_data[kw_data["title"] == title]["kw"].head(3).tolist()
-            return ", ".join(kws) if kws else "データなし"
-
-        pv_sum["流入キーワード(TOP3)"] = pv_sum["title"].apply(get_top_kws)
-        final_df = pv_sum.head(30).rename(columns={"title": "記事タイトル", "pv": "PV数"})
-        return final_df
-
+    # -------------------------------------------------
+    # 戦略B: エラーが出たら「流入元(Source/Medium)」に切り替え
+    # -------------------------------------------------
     except Exception:
-        # エラー時のフォールバック
         request_fb = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=start_date, end_date="today")],
-            dimensions=[Dimension(name="pageTitle")],
+            # ここを変更: キーワードの代わりに「流入元」を取得
+            dimensions=[Dimension(name="pageTitle"), Dimension(name="sessionSourceMedium")],
             metrics=[Metric(name="screenPageViews")],
-            limit=30
+            limit=1000
         )
-        resp_fb = client.run_report(request_fb)
-        data_fb = []
-        if resp_fb.rows:
-            for row in resp_fb.rows:
+        response = client.run_report(request_fb)
+        
+        raw_data = []
+        if response.rows:
+            for row in response.rows:
                 title = row.dimension_values[0].value
+                source = row.dimension_values[1].value # 例: google / organic
                 pv = int(row.metric_values[0].value)
                 if title and title != "(not set)":
-                    data_fb.append({"記事タイトル": title, "PV数": pv, "流入キーワード(TOP3)": "-"})
-        return pd.DataFrame(data_fb)
+                    raw_data.append({"title": title, "info": source, "pv": pv})
+        
+        info_label = "主な流入元(TOP3)"
+
+    # -------------------------------------------------
+    # 共通: 集計処理
+    # -------------------------------------------------
+    df_raw = pd.DataFrame(raw_data)
+    if df_raw.empty: return pd.DataFrame()
+
+    # 1. 記事ごとの合計PV
+    pv_sum = df_raw.groupby("title")["pv"].sum().reset_index().sort_values("pv", ascending=False)
+    
+    # 2. 記事ごとのTOP情報を抽出して結合
+    info_data = df_raw[df_raw["info"] != ""].sort_values("pv", ascending=False)
+    
+    def get_top_infos(title):
+        # その記事の流入情報TOP3を取得
+        infos = info_data[info_data["title"] == title]["info"].head(3).tolist()
+        return ", ".join(infos) if infos else "(不明/Direct)"
+
+    col_name = f"詳細: {info_label}"
+    pv_sum[col_name] = pv_sum["title"].apply(get_top_infos)
+    
+    final_df = pv_sum.head(30).rename(columns={"title": "記事タイトル", "pv": "PV数"})
+    return final_df
 
 # ---------------------------------------------------------
 # 4. 画面表示
@@ -181,23 +197,22 @@ with tab1:
         st.rerun()
 
 with tab2:
-    st.markdown("### 🏆 人気記事 TOP30 & 流入キーワード")
+    st.markdown("### 🏆 人気記事 TOP30")
     period_days = st.selectbox("集計期間を選択", [7, 30], index=1, format_func=lambda x: f"過去 {x} 日間")
     
     for blog in BLOGS:
-        with st.expander(f"📊 {blog['name']} のランキングを見る", expanded=False):
+        with st.expander(f"📊 {blog['name']} のランキング", expanded=False):
             try:
                 df_top = get_top_pages_with_keywords(blog["id"], period_days)
                 if not df_top.empty:
-                    st.markdown("#### 📈 PV数比較 (TOP30)")
+                    # グラフ
+                    st.markdown("#### 📈 PV数比較")
                     chart_df = df_top.set_index("記事タイトル")[["PV数"]].sort_values("PV数", ascending=True)
                     st.bar_chart(chart_df, horizontal=True, color="#FF4B4B")
                     
+                    # 表
                     st.markdown("#### 📝 詳細データ")
-                    st.dataframe(
-                        df_top[["記事タイトル", "PV数", "流入キーワード(TOP3)"]], 
-                        use_container_width=True, hide_index=True, height=500
-                    )
+                    st.dataframe(df_top, use_container_width=True, hide_index=True, height=500)
                 else:
                     st.warning("データなし")
             except Exception as e:

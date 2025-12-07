@@ -8,11 +8,13 @@ import json
 import pytz
 import pandas as pd
 
-# ページ設定
-st.set_page_config(page_title="Blog Analytics", layout="wide")
-st.title("📊 ブログ分析ダッシュボード")
+# ---------------------------------------------------------
+# 設定エリア
+# ---------------------------------------------------------
+st.set_page_config(page_title="Blog Analytics Pro", layout="wide")
+st.title("📊 ブログ分析ダッシュボード Pro")
 
-# 現在時刻（日本時間）
+# 現在時刻
 JST = pytz.timezone('Asia/Tokyo')
 now = datetime.now(JST)
 current_hour = now.hour
@@ -37,10 +39,12 @@ BLOGS = [
 ]
 
 # ---------------------------------------------------------
-# 3. データ取得関数群
+# 3. データ取得ロジック
 # ---------------------------------------------------------
+
+# ① リアルタイムPV
 def get_realtime_metrics(property_id):
-    # A. 今日の累計
+    # 今日の累計
     req_today = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date="today", end_date="today")],
@@ -49,7 +53,7 @@ def get_realtime_metrics(property_id):
     res_today = client.run_report(req_today)
     pv_today = int(res_today.rows[0].metric_values[0].value) if res_today.rows else 0
 
-    # B. 昨日の同時刻データ
+    # 昨日の同時刻
     req_yest = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date="yesterday", end_date="yesterday")],
@@ -70,36 +74,8 @@ def get_realtime_metrics(property_id):
                 
     return pv_today, pv_yest_same, pv_yest_total
 
-def get_top_pages(property_id, days):
-    """
-    検索ワードの代わりに「ページタイトル」を取得する（これは確実に動く）
-    """
-    start_date = f"{days}daysAgo"
-    request = RunReportRequest(
-        property=f"properties/{property_id}",
-        date_ranges=[DateRange(start_date=start_date, end_date="today")],
-        # ここを 'pageTitle' に変更しました
-        dimensions=[Dimension(name="pageTitle")],
-        metrics=[Metric(name="screenPageViews")],
-        limit=20 # 上位20記事を表示
-    )
-    response = client.run_report(request)
-    
-    data = []
-    if response.rows:
-        for row in response.rows:
-            title = row.dimension_values[0].value
-            pv = int(row.metric_values[0].value)
-            # タイトルが空でないものだけ
-            if title and title != "(not set)":
-                data.append({"記事タイトル": title, "PV": pv})
-    
-    return pd.DataFrame(data)
-
+# ② 検索流入トレンド
 def get_organic_trend(property_id):
-    """
-    検索流入の推移
-    """
     request = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
@@ -115,8 +91,6 @@ def get_organic_trend(property_id):
             date_str = row.dimension_values[0].value
             channel = row.dimension_values[1].value
             pv = int(row.metric_values[0].value)
-            
-            # Organic Searchのみ抽出
             if channel == "Organic Search":
                 dt = datetime.strptime(date_str, "%Y%m%d")
                 data.append({"日付": dt, "検索流入PV": pv})
@@ -124,17 +98,93 @@ def get_organic_trend(property_id):
     df = pd.DataFrame(data)
     if not df.empty:
         df = df.groupby("日付").sum()
-        
     return df
+
+# ③ TOP30記事とキーワード（エラー自動回避機能付き）
+def get_top_pages_with_keywords(property_id, days):
+    start_date = f"{days}daysAgo"
+    
+    # --- トライ1: 記事タイトル ＋ 検索キーワード を同時に取得 ---
+    try:
+        request = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=start_date, end_date="today")],
+            # タイトルと検索クエリをセットで要求
+            dimensions=[Dimension(name="pageTitle"), Dimension(name="organicGoogleSearchQuery")],
+            metrics=[Metric(name="screenPageViews")],
+            limit=1000 # 集計前なので多めに取得
+        )
+        response = client.run_report(request)
+        
+        raw_data = []
+        if response.rows:
+            for row in response.rows:
+                title = row.dimension_values[0].value
+                kw = row.dimension_values[1].value
+                pv = int(row.metric_values[0].value)
+                
+                # ゴミデータの除去
+                if title and title != "(not set)":
+                    # キーワードがない場合は「-」にする
+                    clean_kw = kw if kw and kw not in ["(not set)", "(not provided)"] else ""
+                    raw_data.append({"title": title, "kw": clean_kw, "pv": pv})
+        
+        df_raw = pd.DataFrame(raw_data)
+        
+        if df_raw.empty:
+            return pd.DataFrame()
+
+        # --- 集計処理: 記事ごとにPVを合計し、主なキーワードを抽出 ---
+        # 1. 記事ごとの合計PVを計算
+        pv_sum = df_raw.groupby("title")["pv"].sum().reset_index().sort_values("pv", ascending=False)
+        
+        # 2. 記事ごとの「多いキーワード」トップ3を抽出して文字列結合
+        # キーワードがある行だけでランキングを作る
+        kw_data = df_raw[df_raw["kw"] != ""].sort_values("pv", ascending=False)
+        
+        # 各記事のトップ3キーワードを取得して結合する関数
+        def get_top_kws(title):
+            kws = kw_data[kw_data["title"] == title]["kw"].head(3).tolist()
+            return ", ".join(kws) if kws else "データなし"
+
+        pv_sum["流入キーワード(TOP3)"] = pv_sum["title"].apply(get_top_kws)
+        
+        # 上位30記事に絞る
+        final_df = pv_sum.head(30)
+        final_df = final_df.rename(columns={"title": "記事タイトル", "pv": "PV数"})
+        
+        return final_df
+
+    # --- トライ2: キーワード取得でエラーが出たら「タイトルのみ」で再取得（フォールバック） ---
+    except Exception:
+        # 400エラーなどが出た場合、安全策としてタイトルだけでランキングを作る
+        request_fallback = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=start_date, end_date="today")],
+            dimensions=[Dimension(name="pageTitle")],
+            metrics=[Metric(name="screenPageViews")],
+            limit=30
+        )
+        resp_fallback = client.run_report(request_fallback)
+        
+        data_fb = []
+        if resp_fallback.rows:
+            for row in resp_fallback.rows:
+                title = row.dimension_values[0].value
+                pv = int(row.metric_values[0].value)
+                if title and title != "(not set)":
+                    data_fb.append({"記事タイトル": title, "PV数": pv, "流入キーワード(TOP3)": "取得不可(連携未設定)"})
+        
+        return pd.DataFrame(data_fb)
 
 # ---------------------------------------------------------
 # 4. 画面表示
 # ---------------------------------------------------------
 st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-tab1, tab2 = st.tabs(["⏱️ リアルタイムPV", "📖 人気記事ランキング"])
+tab1, tab2 = st.tabs(["⏱️ リアルタイムPV", "🏆 記事ランキングTOP30"])
 
-# --- タブ1 ---
+# --- タブ1: リアルタイム ---
 with tab1:
     cols = st.columns(3)
     for i, blog in enumerate(BLOGS):
@@ -146,48 +196,42 @@ with tab1:
                 pct = (diff / yest_same * 100) if yest_same > 0 else 0
                 st.metric("今日のPV", f"{today:,}", f"{diff:+,} ({pct:+.1f}%)")
                 st.caption(f"昨日同時刻: {yest_same:,} / 昨日計: {yest_total:,}")
-            except Exception as e:
+            except Exception:
                 st.error("取得エラー")
 
     if st.button("更新", key="refresh_realtime"):
         st.rerun()
 
-# --- タブ2 ---
+# --- タブ2: 記事ランキングTOP30 ---
 with tab2:
-    st.markdown("### 📖 人気記事レポート")
+    st.markdown("### 🏆 人気記事 TOP30 & 流入キーワード")
+    
+    # 期間選択（デフォルト30日）
+    period_days = st.selectbox("集計期間を選択", [7, 30], index=1, format_func=lambda x: f"過去 {x} 日間")
+    
     for blog in BLOGS:
-        with st.expander(f"📊 {blog['name']} の詳細を見る", expanded=False):
-            # グラフ
-            st.markdown("#### 📅 検索流入数の推移 (過去30日)")
+        with st.expander(f"📊 {blog['name']} のランキングを見る", expanded=False):
             try:
-                trend_df = get_organic_trend(blog["id"])
-                if not trend_df.empty:
-                    st.line_chart(trend_df, color="#FF4B4B")
+                # データ取得
+                df_top = get_top_pages_with_keywords(blog["id"], period_days)
+                
+                if not df_top.empty:
+                    # 1. 棒グラフ表示 (PV数)
+                    st.markdown("#### 📈 PV数比較 (TOP30)")
+                    # タイトルをインデックスにしてグラフ化
+                    chart_df = df_top.set_index("記事タイトル")[["PV数"]].sort_values("PV数", ascending=True)
+                    st.bar_chart(chart_df, horizontal=True, color="#FF4B4B")
+                    
+                    # 2. 詳細テーブル表示 (キーワード付き)
+                    st.markdown("#### 📝 詳細データ")
+                    st.dataframe(
+                        df_top[["記事タイトル", "PV数", "流入キーワード(TOP3)"]], 
+                        use_container_width=True, 
+                        hide_index=True,
+                        height=500
+                    )
                 else:
-                    st.info("データがありません")
+                    st.warning("データがありません")
+                    
             except Exception as e:
-                st.error(f"グラフ取得エラー: {e}")
-
-            # ランキング表
-            st.markdown("#### 🏆 よく読まれている記事 TOP20")
-            col_left, col_right = st.columns(2)
-            with col_left:
-                st.markdown("**過去 1週間**")
-                try:
-                    df_7 = get_top_pages(blog["id"], 7)
-                    if not df_7.empty:
-                        st.dataframe(df_7, height=400, use_container_width=True)
-                    else:
-                        st.warning("データなし")
-                except Exception as e:
-                    st.error(f"エラー: {e}")
-            with col_right:
-                st.markdown("**過去 1ヶ月**")
-                try:
-                    df_30 = get_top_pages(blog["id"], 30)
-                    if not df_30.empty:
-                        st.dataframe(df_30, height=400, use_container_width=True)
-                    else:
-                        st.warning("データなし")
-                except Exception as e:
-                    st.error(f"エラー: {e}")
+                st.error(f"エラーが発生しました: {e}")

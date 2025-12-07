@@ -1,12 +1,13 @@
 import streamlit as st
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
-    RunReportRequest, DateRange, Metric, Dimension
+    RunReportRequest, DateRange, Metric, Dimension, FilterExpression, Filter, StringFilter
 )
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import pytz
 import pandas as pd
+import urllib.parse
 
 # ---------------------------------------------------------
 # 0. ページ設定 & パスワード認証
@@ -34,7 +35,7 @@ check_password()
 #  メイン処理
 # =========================================================
 
-st.title("📊 ブログ分析ダッシュボード SEO Special")
+st.title("📊 ブログ分析ダッシュボード All-in-One")
 
 JST = pytz.timezone('Asia/Tokyo')
 now = datetime.now(JST)
@@ -51,13 +52,14 @@ except Exception as e:
     st.stop()
 
 # ---------------------------------------------------------
-# 2. ブログ設定
+# 2. ブログ設定 (URLを追加しました)
 # ---------------------------------------------------------
 BLOGS = [
-    {"name": "🚙 ジムニーフリーク！", "id": "470121869"},
-    {"name": "🎣 ソルトルアーのすすめ！", "id": "343862616"},
-    {"name": "👔 公務員転職マン", "id": "445135719"},
+    {"name": "🚙 ジムニーフリーク！", "id": "470121869", "url": "jimny-freak.com"}, # ドメインの一部でOK
+    {"name": "🎣 ソルトルアーのすすめ！", "id": "343862616", "url": "salt-lure.com"},
+    {"name": "👔 公務員転職マン", "id": "445135719", "url": "koumuin-tenshoku.com"},
 ]
+# ※ ご自身の正しいドメイン（URLの一部）に書き換えてください。検索に使います。
 
 # ---------------------------------------------------------
 # 3. データ取得ロジック
@@ -131,19 +133,17 @@ def get_daily_trend_comparison(property_id, days):
     
     return df, sum(curr_data), sum(prev_data)
 
-# ③ 記事ランキング比較 (データなし自動回避・完全版)
+# ③ 記事ランキング (自動回避版)
 def get_article_ranking_comparison(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
     prev_start = f"{days*2}daysAgo"
     prev_end = f"{days+1}daysAgo"
 
-    # --- A. 今期のデータ (キーワード取得に挑戦) ---
     is_keyword_available = True
     raw_data = []
 
     try:
-        # トライ: キーワードと順位を取得
         req_curr = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
@@ -152,7 +152,6 @@ def get_article_ranking_comparison(property_id, days):
             limit=2000
         )
         res_curr = client.run_report(req_curr)
-        
         valid_kw_count = 0
         if res_curr.rows:
             for row in res_curr.rows:
@@ -160,24 +159,17 @@ def get_article_ranking_comparison(property_id, days):
                 kw = row.dimension_values[1].value
                 pv = int(row.metric_values[0].value)
                 rank = float(row.metric_values[1].value)
-                
                 clean_kw = ""
                 if kw and kw not in ["(not set)", "(not provided)"]:
                     clean_kw = kw
                     valid_kw_count += 1
-                
                 if title and title != "(not set)":
                     raw_data.append({"title": title, "kw": clean_kw, "pv": pv, "rank": rank})
-        
-        # ★ここが重要: エラーは出なくても「有効なキーワードが0個」なら失敗とみなす
-        if valid_kw_count == 0:
-            raise ValueError("No valid keywords found")
+        if valid_kw_count == 0: raise ValueError("No valid keywords")
 
     except Exception:
-        # 失敗したら「流入元」取得モードに切り替え
         is_keyword_available = False
-        raw_data = [] # リセット
-        
+        raw_data = []
         req_fb = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
@@ -189,7 +181,7 @@ def get_article_ranking_comparison(property_id, days):
         if res_fb.rows:
             for row in res_fb.rows:
                 title = row.dimension_values[0].value
-                info = row.dimension_values[1].value # source / medium
+                info = row.dimension_values[1].value
                 pv = int(row.metric_values[0].value)
                 if title and title != "(not set)":
                     raw_data.append({"title": title, "kw": info, "pv": pv, "rank": 0})
@@ -197,7 +189,6 @@ def get_article_ranking_comparison(property_id, days):
     df_curr = pd.DataFrame(raw_data)
     if df_curr.empty: return pd.DataFrame()
 
-    # --- B. 前期の順位データ (比較用) ---
     prev_rank_map = {}
     if is_keyword_available:
         try:
@@ -215,10 +206,8 @@ def get_article_ranking_comparison(property_id, days):
                     k = row.dimension_values[1].value
                     r = float(row.metric_values[0].value)
                     prev_rank_map[(t, k)] = r
-        except:
-            pass
+        except: pass
 
-    # --- C. 前期のPVデータ ---
     req_prev_pv = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date=prev_start, end_date=prev_end)],
@@ -232,68 +221,99 @@ def get_article_ranking_comparison(property_id, days):
         for row in res_prev_pv.rows:
             prev_pv_map[row.dimension_values[0].value] = int(row.metric_values[0].value)
 
-    # --- D. 集計と表示整形 ---
     df_grouped = df_curr.groupby("title")["pv"].sum().reset_index().rename(columns={"pv": "今期のPV"})
     df_grouped["前期のPV"] = df_grouped["title"].map(prev_pv_map).fillna(0).astype(int)
-    
-    # PV差分率
     df_grouped["差分"] = df_grouped["今期のPV"] - df_grouped["前期のPV"]
+    
     def calc_pct(row):
         if row["前期のPV"] > 0: return f"{(row['差分'] / row['前期のPV'] * 100):+.1f}%"
         elif row["今期のPV"] > 0: return "NEW"
         else: return "0%"
     df_grouped["前期間比"] = df_grouped.apply(calc_pct, axis=1)
 
-    # 情報カラムの整形
     def format_info(title):
-        # 該当記事のデータを取得
         rows = df_curr[df_curr["title"] == title]
-        
-        # キーワードモードの場合
         if is_keyword_available:
-            # キーワードがあるものだけ抽出してPV順に
             kws = rows[rows["kw"] != ""].sort_values("pv", ascending=False).head(3)
             if kws.empty: return "-"
-            
             res = []
             for _, r in kws.iterrows():
                 kw = r["kw"]
                 cr = r["rank"]
                 pr = prev_rank_map.get((title, kw), 0)
-                
                 rank_str = f"{cr:.1f}位"
                 if pr > 0:
                     diff = pr - cr
                     if diff > 0: rank_str += f" (⬆{diff:.1f})"
                     elif diff < 0: rank_str += f" (⬇{abs(diff):.1f})"
                     else: rank_str += " (➡)"
-                else:
-                    rank_str += " (NEW)"
+                else: rank_str += " (NEW)"
                 res.append(f"{kw}: {rank_str}")
             return " | ".join(res)
-            
-        # 流入元モードの場合 (キーワードが無い時)
         else:
-            # PV順に流入元を並べる
             sources = rows.groupby("kw")["pv"].sum().reset_index().sort_values("pv", ascending=False).head(3)
             return ", ".join(sources["kw"].tolist())
 
     col_name = "検索キーワード(TOP3)" if is_keyword_available else "主な流入元(TOP3)"
     df_grouped[col_name] = df_grouped["title"].apply(format_info)
-
     final = df_grouped.sort_values("今期のPV", ascending=False).head(30)
-    final = final[["title", "今期のPV", "前期のPV", "前期間比", col_name]]
-    final = final.rename(columns={"title": "記事タイトル"})
-    
+    final = final[["title", "今期のPV", "前期のPV", "前期間比", col_name]].rename(columns={"title": "記事タイトル"})
     return final
+
+# ④ SNS流入分析 (新機能)
+def get_sns_traffic(property_id, days=7):
+    """
+    SNSからの流入に絞ってデータを取得する
+    """
+    start_date = f"{days}daysAgo"
+    
+    # 主要SNSのフィルタリング (正規表現)
+    # t.co=Twitter, facebook, instagram, linkedin, pinterest, youtube, threads
+    sns_regex = r"t\.co|twitter|facebook|instagram|linkedin|pinterest|youtube|threads"
+    
+    request = RunReportRequest(
+        property=f"properties/{property_id}",
+        date_ranges=[DateRange(start_date=start_date, end_date="today")],
+        dimensions=[Dimension(name="sessionSource"), Dimension(name="pageTitle")],
+        metrics=[Metric(name="screenPageViews")],
+        filter=FilterExpression(
+            filter=Filter(
+                field_name="sessionSource",
+                string_filter=StringFilter(
+                    match_type="PARTIAL_REGEXP",
+                    value=sns_regex
+                )
+            )
+        )
+    )
+    response = client.run_report(request)
+    
+    data = []
+    if response.rows:
+        for row in response.rows:
+            source = row.dimension_values[0].value
+            title = row.dimension_values[1].value
+            pv = int(row.metric_values[0].value)
+            
+            # ソース名の見栄えを良くする
+            if "t.co" in source or "twitter" in source: source_label = "X (Twitter)"
+            elif "facebook" in source: source_label = "Facebook"
+            elif "instagram" in source: source_label = "Instagram"
+            elif "threads" in source: source_label = "Threads"
+            else: source_label = source
+            
+            data.append({"SNS": source_label, "記事タイトル": title, "PV": pv})
+            
+    return pd.DataFrame(data)
 
 # ---------------------------------------------------------
 # 4. 画面表示
 # ---------------------------------------------------------
 st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-tab1, tab2 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート"])
+tab1, tab2, tab3 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入"])
 
+# --- タブ1: リアルタイム ---
 with tab1:
     cols = st.columns(3)
     for i, blog in enumerate(BLOGS):
@@ -310,15 +330,12 @@ with tab1:
     if st.button("更新", key="refresh_realtime"):
         st.rerun()
 
+# --- タブ2: 期間分析 ---
 with tab2:
     st.markdown("### 📈 期間比較レポート")
-    
     col_sel, _ = st.columns([1, 2])
     with col_sel:
-        period_days = st.selectbox(
-            "分析期間", [7, 30], index=0, 
-            format_func=lambda x: f"過去 {x} 日間 vs その前の {x} 日間"
-        )
+        period_days = st.selectbox("分析期間", [7, 30], index=0, format_func=lambda x: f"過去 {x} 日間")
     
     for blog in BLOGS:
         with st.expander(f"📊 {blog['name']} の詳細分析", expanded=True):
@@ -334,14 +351,58 @@ with tab2:
 
                 df_top = get_article_ranking_comparison(blog["id"], period_days)
                 if not df_top.empty:
-                    st.markdown("#### 🏆 記事別ランキング TOP30")
-                    st.dataframe(
-                        df_top, 
-                        use_container_width=True, 
-                        hide_index=True,
-                        height=600
-                    )
+                    st.markdown("#### 🏆 記事別ランキング TOP30 (検索順位付き)")
+                    st.dataframe(df_top, use_container_width=True, hide_index=True, height=600)
                 else:
                     st.warning("データなし")
             except Exception as e:
                 st.error(f"エラー: {e}")
+
+# --- タブ3: SNS言及・流入 (New!) ---
+with tab3:
+    st.markdown("### 📱 SNS流入 & エゴサーチ")
+    st.caption("過去7日間にSNS（X, FB, Insta等）から流入があった記事と、SNS上の反応を確認します。")
+    
+    for blog in BLOGS:
+        with st.expander(f"💬 {blog['name']}", expanded=True):
+            
+            # 1. GA4によるSNS流入データ
+            try:
+                df_sns = get_sns_traffic(blog["id"], 7) # 過去7日間
+                if not df_sns.empty:
+                    total_sns_pv = df_sns["PV"].sum()
+                    st.metric("SNS経由の総PV (過去7日)", f"{total_sns_pv} PV")
+                    
+                    # 内訳グラフ
+                    chart_data = df_sns.groupby("SNS")["PV"].sum()
+                    st.bar_chart(chart_data, color="#1DA1F2")
+                    
+                    # 詳細テーブル
+                    st.markdown("**📌 SNSで話題になった記事**")
+                    st.dataframe(df_sns, use_container_width=True, hide_index=True)
+                else:
+                    st.info("過去7日間、SNSからの流入（クリック）はありませんでした。")
+            
+            except Exception as e:
+                st.error(f"データ取得エラー: {e}")
+
+            st.markdown("---")
+            
+            # 2. エゴサーチボタン (Yahooリアルタイム検索などへのリンク)
+            st.markdown("**🔎 実際の投稿を探す (エゴサーチ)**")
+            st.caption("ボタンを押すと、Yahoo!リアルタイム検索（Xの投稿検索）などの結果ページを開きます。")
+            
+            # 検索用URL生成 (ドメイン名で検索)
+            # 例: "jimny-freak.com" を含むツイートを検索
+            search_query = urllib.parse.quote(blog.get("url", "")) # 設定にurlがない場合は空
+            
+            if search_query:
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+                    yahoo_url = f"https://search.yahoo.co.jp/realtime/search?p={search_query}"
+                    st.link_button("X(Twitter)の反応を見る (Yahooリアルタイム)", yahoo_url)
+                with col_btn2:
+                    google_url = f"https://www.google.com/search?q=site:x.com+{search_query}+OR+site:facebook.com+{search_query}"
+                    st.link_button("SNS全体をGoogle検索", google_url)
+            else:
+                st.warning("※コード内のBLOGS設定に 'url' を追加してください")

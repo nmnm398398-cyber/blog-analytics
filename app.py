@@ -70,36 +70,39 @@ def get_realtime_metrics(property_id):
                 
     return pv_today, pv_yest_same, pv_yest_total
 
-def get_search_keywords(property_id, days):
+def get_top_pages(property_id, days):
+    """
+    検索ワードの代わりに「ページタイトル」を取得する（これは確実に動く）
+    """
     start_date = f"{days}daysAgo"
     request = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date=start_date, end_date="today")],
-        dimensions=[Dimension(name="organicGoogleSearchQuery")],
+        # ここを 'pageTitle' に変更しました
+        dimensions=[Dimension(name="pageTitle")],
         metrics=[Metric(name="screenPageViews")],
-        limit=100
+        limit=20 # 上位20記事を表示
     )
     response = client.run_report(request)
     
     data = []
     if response.rows:
         for row in response.rows:
-            word = row.dimension_values[0].value
+            title = row.dimension_values[0].value
             pv = int(row.metric_values[0].value)
-            # ノイズ除去
-            if word and word not in ["(not set)", "(not provided)"]:
-                data.append({"キーワード": word, "PV": pv})
+            # タイトルが空でないものだけ
+            if title and title != "(not set)":
+                data.append({"記事タイトル": title, "PV": pv})
     
     return pd.DataFrame(data)
 
 def get_organic_trend(property_id):
     """
-    検索流入の推移を取得（API側でフィルタせず、Python側で抽出する方式に変更）
+    検索流入の推移
     """
     request = RunReportRequest(
         property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
-        # 日付とチャネル（流入元）を取得
         dimensions=[Dimension(name="date"), Dimension(name="sessionDefaultChannelGroup")],
         metrics=[Metric(name="screenPageViews")],
         order_bys=[{"dimension": {"dimension_name": "date"}}]
@@ -110,16 +113,15 @@ def get_organic_trend(property_id):
     if response.rows:
         for row in response.rows:
             date_str = row.dimension_values[0].value
-            channel = row.dimension_values[1].value # 流入元
+            channel = row.dimension_values[1].value
             pv = int(row.metric_values[0].value)
             
-            # ここで「Organic Search」だけを拾う（Python側で処理）
+            # Organic Searchのみ抽出
             if channel == "Organic Search":
                 dt = datetime.strptime(date_str, "%Y%m%d")
                 data.append({"日付": dt, "検索流入PV": pv})
             
     df = pd.DataFrame(data)
-    # 日付ごとの合計を再集計（念のため）
     if not df.empty:
         df = df.groupby("日付").sum()
         
@@ -130,7 +132,7 @@ def get_organic_trend(property_id):
 # ---------------------------------------------------------
 st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-tab1, tab2 = st.tabs(["⏱️ リアルタイムPV", "🔍 検索ワード分析"])
+tab1, tab2 = st.tabs(["⏱️ リアルタイムPV", "📖 人気記事ランキング"])
 
 # --- タブ1 ---
 with tab1:
@@ -152,25 +154,27 @@ with tab1:
 
 # --- タブ2 ---
 with tab2:
-    st.markdown("### 🔍 検索流入レポート")
+    st.markdown("### 📖 人気記事レポート")
     for blog in BLOGS:
-        with st.expander(f"📊 {blog['name']} の分析を見る", expanded=False):
-            st.markdown("#### 📅 過去30日の検索流入推移")
+        with st.expander(f"📊 {blog['name']} の詳細を見る", expanded=False):
+            # グラフ
+            st.markdown("#### 📅 検索流入数の推移 (過去30日)")
             try:
                 trend_df = get_organic_trend(blog["id"])
                 if not trend_df.empty:
                     st.line_chart(trend_df, color="#FF4B4B")
                 else:
-                    st.info("データがありません（または検索流入ゼロ）")
+                    st.info("データがありません")
             except Exception as e:
                 st.error(f"グラフ取得エラー: {e}")
 
-            st.markdown("#### 🔑 流入キーワード TOP100")
+            # ランキング表
+            st.markdown("#### 🏆 よく読まれている記事 TOP20")
             col_left, col_right = st.columns(2)
             with col_left:
                 st.markdown("**過去 1週間**")
                 try:
-                    df_7 = get_search_keywords(blog["id"], 7)
+                    df_7 = get_top_pages(blog["id"], 7)
                     if not df_7.empty:
                         st.dataframe(df_7, height=400, use_container_width=True)
                     else:
@@ -180,7 +184,7 @@ with tab2:
             with col_right:
                 st.markdown("**過去 1ヶ月**")
                 try:
-                    df_30 = get_search_keywords(blog["id"], 30)
+                    df_30 = get_top_pages(blog["id"], 30)
                     if not df_30.empty:
                         st.dataframe(df_30, height=400, use_container_width=True)
                     else:

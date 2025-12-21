@@ -13,7 +13,7 @@ import re
 # ---------------------------------------------------------
 # 0. ページ設定 & パスワード認証
 # ---------------------------------------------------------
-st.set_page_config(page_title="Blog Analytics Pro", layout="wide")
+st.set_page_config(page_title="Blog Analytics Debug", layout="wide")
 
 def check_password():
     if "authenticated" not in st.session_state:
@@ -36,7 +36,8 @@ check_password()
 #  メイン処理
 # =========================================================
 
-st.title("📊 ブログ分析ダッシュボード")
+st.title("📊 ブログ分析ダッシュボード (Raw Error Mode)")
+st.caption("※エラーが発生した場合、Google APIからの返答をそのまま表示します。")
 
 JST = pytz.timezone('Asia/Tokyo')
 now = datetime.now(JST)
@@ -95,7 +96,8 @@ def get_realtime_metrics(property_id):
                     pv_yest_same += pv
                     
         return pv_today, pv_yest_same, pv_yest_total
-    except Exception:
+    except Exception as e:
+        st.error(f"リアルタイム取得エラー: {e}")
         return 0, 0, 0
 
 # ② 日別推移グラフ
@@ -136,17 +138,18 @@ def get_daily_trend_comparison(property_id, days):
         })
         
         return df, sum(curr_data), sum(prev_data)
-    except Exception:
+    except Exception as e:
+        st.error(f"日別推移取得エラー: {e}")
         return pd.DataFrame(), 0, 0
 
-# ③ 記事ランキング
-def get_article_ranking_separated(property_id, days):
+# ③ 記事ランキング (キーワード取得のエラーを隠さない版)
+def get_article_ranking_raw(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
     prev_start = f"{days*2}daysAgo"
     prev_end = f"{days+1}daysAgo"
 
-    # Step 1. PV取得
+    # Step 1. まずPVベースで記事リストを取得
     try:
         req_pv = RunReportRequest(
             property=f"properties/{property_id}",
@@ -165,15 +168,19 @@ def get_article_ranking_separated(property_id, days):
                 "pv": int(row.metric_values[0].value)
             })
         df_base = pd.DataFrame(base_data)
-    except Exception:
+    except Exception as e:
+        st.error(f"PVデータ取得エラー: {e}")
         return pd.DataFrame()
 
-    # Step 2. キーワード取得
+    # Step 2. 検索キーワードを取得 (Separated Request)
     kw_map = {}
+    
+    # ★ここに try-except は入れるが、エラー内容は隠さず表示する
     try:
         req_kw = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
+            # 「検索クエリ」と「順位」を取得
             dimensions=[Dimension(name="pageTitle"), Dimension(name="organicGoogleSearchQuery")],
             metrics=[Metric(name="screenPageViews"), Metric(name="organicGoogleSearchAveragePosition")],
             limit=5000
@@ -199,10 +206,14 @@ def get_article_ranking_separated(property_id, days):
                     for _, r in top_kws.iterrows():
                         kw_strs.append(f"{r['kw']} ({r['rank']:.1f}位)")
                     kw_map[title] = " | ".join(kw_strs)
-    except Exception:
-        pass
+                    
+    except Exception as e:
+        # ★エラーを隠さず画面に表示する
+        st.error(f"🚨 キーワード取得APIエラー (ID: {property_id}):")
+        st.code(str(e))
+        st.warning("上記エラーのため、キーワード列は空欄、または流入元が表示されます。")
 
-    # Step 3. 流入元取得
+    # Step 3. 流入元を取得 (補完用)
     source_map = {}
     try:
         req_src = RunReportRequest(
@@ -225,8 +236,8 @@ def get_article_ranking_separated(property_id, days):
             for title, group in df_src.groupby("title"):
                 top_srcs = group.sort_values("pv", ascending=False).head(3)["source"].tolist()
                 source_map[title] = " | ".join([f"[{s}]" for s in top_srcs])
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"流入元取得エラー: {e}")
 
     # Step 4. 前期PV
     prev_pv_map = {}
@@ -242,7 +253,8 @@ def get_article_ranking_separated(property_id, days):
         if res_prev.rows:
             for row in res_prev.rows:
                 prev_pv_map[row.dimension_values[0].value] = int(row.metric_values[0].value)
-    except: pass
+    except Exception:
+        pass
 
     # 結合
     df_base["前期のPV"] = df_base["title"].map(prev_pv_map).fillna(0).astype(int)
@@ -254,7 +266,9 @@ def get_article_ranking_separated(property_id, days):
     df_base["前期間比"] = df_base.apply(calc_pct, axis=1)
 
     def resolve_info(title):
+        # キーワードがあればそれを表示
         if title in kw_map: return kw_map[title]
+        # なければ流入元を表示
         elif title in source_map: return source_map[title]
         else: return "-"
 
@@ -277,7 +291,8 @@ def get_sns_traffic_safe(property_id, domain, days=7):
             limit=5000
         )
         response = client.run_report(request)
-    except Exception:
+    except Exception as e:
+        st.error(f"SNSデータ取得エラー: {e}")
         return pd.DataFrame()
 
     data = []
@@ -302,14 +317,12 @@ def get_sns_traffic_safe(property_id, domain, days=7):
             
     return pd.DataFrame(data)
 
-# ⑤ 徹底診断機能（透視モード）
+# ⑤ 徹底診断機能
 def run_deep_diagnostic(property_id):
     st.write("---")
     st.markdown(f"### 🩺 徹底解剖診断 (ID: `{property_id}`)")
-    st.info("Googleが実際に返している「生のデータ」をそのまま表示します。")
     
-    # テスト1: 連携自体が有効かチェック
-    st.markdown("#### Test 1: Search Console連携チェック")
+    # 単純なキーワード取得テスト
     try:
         req = RunReportRequest(
             property=f"properties/{property_id}",
@@ -321,33 +334,21 @@ def run_deep_diagnostic(property_id):
         res = client.run_report(req)
         
         if res.rows:
-            data = []
-            for row in res.rows:
-                val = row.dimension_values[0].value
-                data.append(val)
+            data = [row.dimension_values[0].value for row in res.rows]
             st.success("✅ 通信成功: データが返ってきています。")
-            st.code(f"返ってきたデータの中身: {data}")
+            st.code(f"取得データサンプル: {data}")
             
             if all(d in ["(not set)", "(not provided)", ""] for d in data):
-                st.warning("⚠️ **中身が空っぽです**")
-                st.write("通信はできていますが、全てのキーワードが `(not set)` です。")
-                st.write("👉 **原因:** ロボットを追加した直後で、データ同期が追いついていません。**明日また見てください。**")
+                st.warning("⚠️ 返ってきたデータは全て `(not set)` です。")
             else:
-                st.success("🎉 **キーワードが見えます！**")
-                st.write("いくつかのデータは来ているようです。ランキング画面の「分析期間」を30日に伸ばしてみてください。")
+                st.success("🎉 有効なキーワードが含まれています！")
         else:
-            st.warning("⚠️ **データ0件**")
-            st.write("エラーではありませんが、データが1行もありません。")
-            st.write("👉 **対策:** 分析期間内に検索流入がなかったか、連携URLが間違っている可能性があります。")
+            st.warning("⚠️ データが0件です (エラーではありません)")
             
     except Exception as e:
-        st.error("❌ **致命的なエラー**")
-        st.error(str(e))
-        st.markdown("""
-        **エラーが出た場合の原因:**
-        1. **URL不一致:** GA4で連携したURL（http/httpsの違いなど）が間違っている。
-        2. **権限不足:** ロボットのメールアドレスがSearch Consoleに追加されていない。
-        """)
+        st.error("❌ **APIエラー発生**")
+        st.code(str(e))
+        st.write("このエラーメッセージが、Googleがデータを拒否している理由です。")
 
 # ---------------------------------------------------------
 # 4. 画面表示
@@ -368,7 +369,7 @@ with tab1:
                 st.metric("今日のPV", f"{today:,}", f"{diff:+,} ({pct:+.1f}%)")
                 st.caption(f"昨日同時刻: {yest_same:,} / 昨日計: {yest_total:,}")
             except Exception:
-                st.error("取得エラー")
+                pass
     if st.button("更新", key="refresh_realtime"):
         st.rerun()
 
@@ -376,7 +377,7 @@ with tab2:
     st.markdown("### 📈 期間比較レポート")
     col_sel, _ = st.columns([1, 2])
     with col_sel:
-        # デフォルトを30日に変更（データが出やすくなるため）
+        # 30日をデフォルトに
         period_days = st.selectbox("分析期間", [7, 30], index=1, format_func=lambda x: f"過去 {x} 日間")
     
     for blog in BLOGS:
@@ -390,14 +391,15 @@ with tab2:
                     st.line_chart(df_trend, color=["#FF4B4B", "#CCCCCC"]) 
                     st.caption("赤線: 今期 / グレー線: 前期")
                 
-                df_top = get_article_ranking_separated(blog["id"], period_days)
+                # エラー隠蔽なしのランキング取得
+                df_top = get_article_ranking_raw(blog["id"], period_days)
                 if not df_top.empty:
                     st.markdown("#### 🏆 記事別ランキング TOP30")
                     st.dataframe(df_top, use_container_width=True, hide_index=True, height=600)
                 else:
                     st.warning("データなし")
             except Exception as e:
-                st.error(f"エラー: {e}")
+                st.error(f"全体処理エラー: {e}")
 
 with tab3:
     st.markdown("### 📱 SNS流入 & エゴサーチ")
@@ -417,7 +419,7 @@ with tab3:
                 else:
                     st.info("SNS流入なし")
             except Exception as e:
-                st.error(f"エラー: {e}")
+                st.error(f"SNSエラー: {e}")
             st.markdown("---")
             q = urllib.parse.quote(blog.get("url", "")) 
             if q:
@@ -426,8 +428,7 @@ with tab3:
                 c2.link_button("SNS全体Google検索", f"https://www.google.com/search?q=site:x.com+{q}+OR+site:facebook.com+{q}")
 
 with tab4:
-    st.markdown("### 🛠️ 徹底診断（なぜキーワードが出ないのか？）")
-    st.write("Googleから返ってきている「生のデータ」を確認します。")
+    st.markdown("### 🛠️ 徹底診断")
     selected_blog = st.selectbox("診断するブログを選択", [b["name"] for b in BLOGS])
     if st.button("診断開始"):
         target_id = next(b["id"] for b in BLOGS if b["name"] == selected_blog)

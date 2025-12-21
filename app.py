@@ -36,7 +36,7 @@ check_password()
 #  メイン処理
 # =========================================================
 
-st.title("📊 ブログ分析ダッシュボード (Keyword Fix)")
+st.title("📊 ブログ分析ダッシュボード")
 
 JST = pytz.timezone('Asia/Tokyo')
 now = datetime.now(JST)
@@ -139,16 +139,14 @@ def get_daily_trend_comparison(property_id, days):
     except Exception:
         return pd.DataFrame(), 0, 0
 
-# ③ 記事ランキング (リクエスト分離・結合方式)
+# ③ 記事ランキング
 def get_article_ranking_separated(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
     prev_start = f"{days*2}daysAgo"
     prev_end = f"{days+1}daysAgo"
 
-    # ------------------------------------------------
-    # Step 1. まず記事ランキング（PVベース）を取得
-    # ------------------------------------------------
+    # Step 1. PV取得
     try:
         req_pv = RunReportRequest(
             property=f"properties/{property_id}",
@@ -158,8 +156,7 @@ def get_article_ranking_separated(property_id, days):
             limit=3000
         )
         res_pv = client.run_report(req_pv)
-        
-        if not res_pv.rows: return pd.DataFrame() # データなし
+        if not res_pv.rows: return pd.DataFrame()
 
         base_data = []
         for row in res_pv.rows:
@@ -168,29 +165,22 @@ def get_article_ranking_separated(property_id, days):
                 "pv": int(row.metric_values[0].value)
             })
         df_base = pd.DataFrame(base_data)
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
-    # ------------------------------------------------
-    # Step 2. 検索キーワードを取得 (単独リクエスト)
-    # ※ GA4とGSCのディメンションを混ぜない
-    # ------------------------------------------------
+    # Step 2. キーワード取得
     kw_map = {}
-    is_kw_success = False
-    
     try:
         req_kw = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
             dimensions=[Dimension(name="pageTitle"), Dimension(name="organicGoogleSearchQuery")],
             metrics=[Metric(name="screenPageViews"), Metric(name="organicGoogleSearchAveragePosition")],
-            limit=5000 # 多めに取得
+            limit=5000
         )
         res_kw = client.run_report(req_kw)
         
         if res_kw.rows:
-            is_kw_success = True
-            # 一旦リスト化
             temp_kw_list = []
             for row in res_kw.rows:
                 title = row.dimension_values[0].value
@@ -201,23 +191,18 @@ def get_article_ranking_separated(property_id, days):
                 if kw and kw not in ["(not set)", "(not provided)", ""]:
                     temp_kw_list.append({"title": title, "kw": kw, "pv": pv, "rank": rank})
             
-            # DataFrame化して記事ごとに集約
             if temp_kw_list:
                 df_kw = pd.DataFrame(temp_kw_list)
-                # 記事ごとにPV順で上位3つを抽出
                 for title, group in df_kw.groupby("title"):
                     top_kws = group.sort_values("pv", ascending=False).head(3)
                     kw_strs = []
                     for _, r in top_kws.iterrows():
                         kw_strs.append(f"{r['kw']} ({r['rank']:.1f}位)")
                     kw_map[title] = " | ".join(kw_strs)
-
     except Exception:
-        pass # キーワード取得失敗時は無視 (mapは空のまま)
+        pass
 
-    # ------------------------------------------------
-    # Step 3. 流入元を取得 (キーワードが取れなかった時の予備)
-    # ------------------------------------------------
+    # Step 3. 流入元取得
     source_map = {}
     try:
         req_src = RunReportRequest(
@@ -239,14 +224,11 @@ def get_article_ranking_separated(property_id, days):
             df_src = pd.DataFrame(temp_src_list)
             for title, group in df_src.groupby("title"):
                 top_srcs = group.sort_values("pv", ascending=False).head(3)["source"].tolist()
-                # キーワードっぽくないことを示すため [] で囲む
                 source_map[title] = " | ".join([f"[{s}]" for s in top_srcs])
     except Exception:
         pass
 
-    # ------------------------------------------------
-    # Step 4. 前期PV (比較用)
-    # ------------------------------------------------
+    # Step 4. 前期PV
     prev_pv_map = {}
     try:
         req_prev = RunReportRequest(
@@ -262,14 +244,8 @@ def get_article_ranking_separated(property_id, days):
                 prev_pv_map[row.dimension_values[0].value] = int(row.metric_values[0].value)
     except: pass
 
-    # ------------------------------------------------
-    # Step 5. データの結合 (Merge)
-    # ------------------------------------------------
-    
-    # 前期PV結合
+    # 結合
     df_base["前期のPV"] = df_base["title"].map(prev_pv_map).fillna(0).astype(int)
-    
-    # 差分計算
     df_base["差分"] = df_base["pv"] - df_base["前期のPV"]
     def calc_pct(row):
         if row["前期のPV"] > 0: return f"{(row['差分'] / row['前期のPV'] * 100):+.1f}%"
@@ -277,25 +253,16 @@ def get_article_ranking_separated(property_id, days):
         else: return "0%"
     df_base["前期間比"] = df_base.apply(calc_pct, axis=1)
 
-    # 詳細情報（キーワード優先、無ければ流入元）を結合
     def resolve_info(title):
-        # 1. キーワードマップにあるか？
-        if title in kw_map:
-            return kw_map[title]
-        # 2. なければ流入元マップにあるか？
-        elif title in source_map:
-            return source_map[title]
-        # 3. どちらもなければハイフン
-        else:
-            return "-"
+        if title in kw_map: return kw_map[title]
+        elif title in source_map: return source_map[title]
+        else: return "-"
 
     df_base["検索キーワード / 流入元"] = df_base["title"].apply(resolve_info)
-
-    # 最終整形
+    
     final = df_base.sort_values("pv", ascending=False).head(30)
     final = final[["title", "pv", "前期のPV", "前期間比", "検索キーワード / 流入元"]]
     final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
-    
     return final
 
 # ④ SNS流入分析
@@ -329,20 +296,65 @@ def get_sns_traffic_safe(property_id, domain, days=7):
                 elif "facebook" in source: label = "Facebook"
                 elif "instagram" in source: label = "Instagram"
                 elif "threads" in source: label = "Threads"
-                
                 full_url = f"{domain}{path}"
                 search_url = f"https://search.yahoo.co.jp/realtime/search?p={urllib.parse.quote(full_url)}"
-                
                 data.append({"SNS": label, "記事タイトル": title, "PV": pv, "search_link": search_url})
             
     return pd.DataFrame(data)
+
+# ⑤ 徹底診断機能（透視モード）
+def run_deep_diagnostic(property_id):
+    st.write("---")
+    st.markdown(f"### 🩺 徹底解剖診断 (ID: `{property_id}`)")
+    st.info("Googleが実際に返している「生のデータ」をそのまま表示します。")
+    
+    # テスト1: 連携自体が有効かチェック
+    st.markdown("#### Test 1: Search Console連携チェック")
+    try:
+        req = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
+            dimensions=[Dimension(name="organicGoogleSearchQuery")],
+            metrics=[Metric(name="organicGoogleSearchAveragePosition")],
+            limit=5
+        )
+        res = client.run_report(req)
+        
+        if res.rows:
+            data = []
+            for row in res.rows:
+                val = row.dimension_values[0].value
+                data.append(val)
+            st.success("✅ 通信成功: データが返ってきています。")
+            st.code(f"返ってきたデータの中身: {data}")
+            
+            if all(d in ["(not set)", "(not provided)", ""] for d in data):
+                st.warning("⚠️ **中身が空っぽです**")
+                st.write("通信はできていますが、全てのキーワードが `(not set)` です。")
+                st.write("👉 **原因:** ロボットを追加した直後で、データ同期が追いついていません。**明日また見てください。**")
+            else:
+                st.success("🎉 **キーワードが見えます！**")
+                st.write("いくつかのデータは来ているようです。ランキング画面の「分析期間」を30日に伸ばしてみてください。")
+        else:
+            st.warning("⚠️ **データ0件**")
+            st.write("エラーではありませんが、データが1行もありません。")
+            st.write("👉 **対策:** 分析期間内に検索流入がなかったか、連携URLが間違っている可能性があります。")
+            
+    except Exception as e:
+        st.error("❌ **致命的なエラー**")
+        st.error(str(e))
+        st.markdown("""
+        **エラーが出た場合の原因:**
+        1. **URL不一致:** GA4で連携したURL（http/httpsの違いなど）が間違っている。
+        2. **権限不足:** ロボットのメールアドレスがSearch Consoleに追加されていない。
+        """)
 
 # ---------------------------------------------------------
 # 4. 画面表示
 # ---------------------------------------------------------
 st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-tab1, tab2, tab3 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入"])
+tab1, tab2, tab3, tab4 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入", "🛠️ 徹底診断"])
 
 with tab1:
     cols = st.columns(3)
@@ -364,12 +376,12 @@ with tab2:
     st.markdown("### 📈 期間比較レポート")
     col_sel, _ = st.columns([1, 2])
     with col_sel:
-        period_days = st.selectbox("分析期間", [7, 30], index=0, format_func=lambda x: f"過去 {x} 日間")
+        # デフォルトを30日に変更（データが出やすくなるため）
+        period_days = st.selectbox("分析期間", [7, 30], index=1, format_func=lambda x: f"過去 {x} 日間")
     
     for blog in BLOGS:
         with st.expander(f"📊 {blog['name']} の詳細分析", expanded=True):
             try:
-                # 日別推移
                 df_trend, curr_sum, prev_sum = get_daily_trend_comparison(blog["id"], period_days)
                 diff_total = curr_sum - prev_sum
                 pct_total = (diff_total / prev_sum * 100) if prev_sum > 0 else 0
@@ -378,7 +390,6 @@ with tab2:
                     st.line_chart(df_trend, color=["#FF4B4B", "#CCCCCC"]) 
                     st.caption("赤線: 今期 / グレー線: 前期")
                 
-                # ランキング (リクエスト分離方式)
                 df_top = get_article_ranking_separated(blog["id"], period_days)
                 if not df_top.empty:
                     st.markdown("#### 🏆 記事別ランキング TOP30")
@@ -413,3 +424,11 @@ with tab3:
                 c1, c2 = st.columns(2)
                 c1.link_button("X(Twitter)反応", f"https://search.yahoo.co.jp/realtime/search?p={q}")
                 c2.link_button("SNS全体Google検索", f"https://www.google.com/search?q=site:x.com+{q}+OR+site:facebook.com+{q}")
+
+with tab4:
+    st.markdown("### 🛠️ 徹底診断（なぜキーワードが出ないのか？）")
+    st.write("Googleから返ってきている「生のデータ」を確認します。")
+    selected_blog = st.selectbox("診断するブログを選択", [b["name"] for b in BLOGS])
+    if st.button("診断開始"):
+        target_id = next(b["id"] for b in BLOGS if b["name"] == selected_blog)
+        run_deep_diagnostic(target_id)

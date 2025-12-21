@@ -36,7 +36,7 @@ check_password()
 #  メイン処理
 # =========================================================
 
-st.title("📊 ブログ分析ダッシュボード")
+st.title("📊 ブログ分析ダッシュボード (Keyword Fix)")
 
 JST = pytz.timezone('Asia/Tokyo')
 now = datetime.now(JST)
@@ -139,163 +139,163 @@ def get_daily_trend_comparison(property_id, days):
     except Exception:
         return pd.DataFrame(), 0, 0
 
-# ③ 記事ランキング (自動修復機能付き)
-def get_article_ranking_comparison(property_id, days):
+# ③ 記事ランキング (リクエスト分離・結合方式)
+def get_article_ranking_separated(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
     prev_start = f"{days*2}daysAgo"
     prev_end = f"{days+1}daysAgo"
 
-    raw_data = []
-    
-    # ★ポイント：キーワード取得可否フラグ
-    # 成功すればTrue, エラーが出たらFalseになり、流入元取得モードに切り替わる
-    keyword_mode = True 
-
-    # --- A. 今期のデータ取得 ---
+    # ------------------------------------------------
+    # Step 1. まず記事ランキング（PVベース）を取得
+    # ------------------------------------------------
     try:
-        # まずはキーワード取得に挑戦
-        req_curr = RunReportRequest(
+        req_pv = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
-            dimensions=[
-                Dimension(name="pageTitle"), 
-                Dimension(name="organicGoogleSearchQuery"), 
-                Dimension(name="sessionSourceMedium")
-            ],
-            metrics=[Metric(name="screenPageViews"), Metric(name="organicGoogleSearchAveragePosition")],
+            dimensions=[Dimension(name="pageTitle")],
+            metrics=[Metric(name="screenPageViews")],
             limit=3000
         )
-        res_curr = client.run_report(req_curr)
+        res_pv = client.run_report(req_pv)
         
-        if res_curr.rows:
-            for row in res_curr.rows:
+        if not res_pv.rows: return pd.DataFrame() # データなし
+
+        base_data = []
+        for row in res_pv.rows:
+            base_data.append({
+                "title": row.dimension_values[0].value,
+                "pv": int(row.metric_values[0].value)
+            })
+        df_base = pd.DataFrame(base_data)
+    except Exception as e:
+        return pd.DataFrame()
+
+    # ------------------------------------------------
+    # Step 2. 検索キーワードを取得 (単独リクエスト)
+    # ※ GA4とGSCのディメンションを混ぜない
+    # ------------------------------------------------
+    kw_map = {}
+    is_kw_success = False
+    
+    try:
+        req_kw = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
+            dimensions=[Dimension(name="pageTitle"), Dimension(name="organicGoogleSearchQuery")],
+            metrics=[Metric(name="screenPageViews"), Metric(name="organicGoogleSearchAveragePosition")],
+            limit=5000 # 多めに取得
+        )
+        res_kw = client.run_report(req_kw)
+        
+        if res_kw.rows:
+            is_kw_success = True
+            # 一旦リスト化
+            temp_kw_list = []
+            for row in res_kw.rows:
                 title = row.dimension_values[0].value
                 kw = row.dimension_values[1].value
-                source = row.dimension_values[2].value
                 pv = int(row.metric_values[0].value)
                 rank = float(row.metric_values[1].value)
-
-                # キーワードがあれば採用、なければ流入元を採用
-                display_info = ""
-                is_valid_kw = False
                 
                 if kw and kw not in ["(not set)", "(not provided)", ""]:
-                    display_info = kw
-                    is_valid_kw = True
-                else:
-                    display_info = f"[{source}]"
-                    rank = 0
-
-                if title and title != "(not set)":
-                    raw_data.append({
-                        "title": title, "info": display_info, "pv": pv, "rank": rank, "is_kw": is_valid_kw
-                    })
+                    temp_kw_list.append({"title": title, "kw": kw, "pv": pv, "rank": rank})
+            
+            # DataFrame化して記事ごとに集約
+            if temp_kw_list:
+                df_kw = pd.DataFrame(temp_kw_list)
+                # 記事ごとにPV順で上位3つを抽出
+                for title, group in df_kw.groupby("title"):
+                    top_kws = group.sort_values("pv", ascending=False).head(3)
+                    kw_strs = []
+                    for _, r in top_kws.iterrows():
+                        kw_strs.append(f"{r['kw']} ({r['rank']:.1f}位)")
+                    kw_map[title] = " | ".join(kw_strs)
 
     except Exception:
-        # ★エラー発生時（キーワード権限がない時）の救済措置
-        keyword_mode = False
-        raw_data = [] # 一旦リセット
-        
-        # 画面に警告は出さず、静かに流入元モードで再取得する
-        try:
-            req_fb = RunReportRequest(
-                property=f"properties/{property_id}",
-                date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
-                dimensions=[Dimension(name="pageTitle"), Dimension(name="sessionSourceMedium")],
-                metrics=[Metric(name="screenPageViews")],
-                limit=1000
-            )
-            res_fb = client.run_report(req_fb)
-            if res_fb.rows:
-                for row in res_fb.rows:
-                    title = row.dimension_values[0].value
-                    info = row.dimension_values[1].value
-                    pv = int(row.metric_values[0].value)
-                    if title and title != "(not set)":
-                        raw_data.append({
-                            "title": title, "info": f"[{info}]", "pv": pv, "rank": 0, "is_kw": False
-                        })
-        except:
-            return pd.DataFrame()
+        pass # キーワード取得失敗時は無視 (mapは空のまま)
 
-    df_curr = pd.DataFrame(raw_data)
-    if df_curr.empty: return pd.DataFrame()
+    # ------------------------------------------------
+    # Step 3. 流入元を取得 (キーワードが取れなかった時の予備)
+    # ------------------------------------------------
+    source_map = {}
+    try:
+        req_src = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
+            dimensions=[Dimension(name="pageTitle"), Dimension(name="sessionSourceMedium")],
+            metrics=[Metric(name="screenPageViews")],
+            limit=3000
+        )
+        res_src = client.run_report(req_src)
+        if res_src.rows:
+            temp_src_list = []
+            for row in res_src.rows:
+                temp_src_list.append({
+                    "title": row.dimension_values[0].value,
+                    "source": row.dimension_values[1].value,
+                    "pv": int(row.metric_values[0].value)
+                })
+            df_src = pd.DataFrame(temp_src_list)
+            for title, group in df_src.groupby("title"):
+                top_srcs = group.sort_values("pv", ascending=False).head(3)["source"].tolist()
+                # キーワードっぽくないことを示すため [] で囲む
+                source_map[title] = " | ".join([f"[{s}]" for s in top_srcs])
+    except Exception:
+        pass
 
-    # --- B. 前期データ (キーワードモードが生きている時だけ順位比較) ---
-    prev_rank_map = {}
-    if keyword_mode:
-        try:
-            req_prev = RunReportRequest(
-                property=f"properties/{property_id}",
-                date_ranges=[DateRange(start_date=prev_start, end_date=prev_end)],
-                dimensions=[Dimension(name="pageTitle"), Dimension(name="organicGoogleSearchQuery")],
-                metrics=[Metric(name="organicGoogleSearchAveragePosition")],
-                limit=3000
-            )
-            res_prev = client.run_report(req_prev)
-            if res_prev.rows:
-                for row in res_prev.rows:
-                    t = row.dimension_values[0].value
-                    k = row.dimension_values[1].value
-                    r = float(row.metric_values[0].value)
-                    prev_rank_map[(t, k)] = r
-        except: pass
-
-    # 前期PV
+    # ------------------------------------------------
+    # Step 4. 前期PV (比較用)
+    # ------------------------------------------------
     prev_pv_map = {}
     try:
-        req_prev_pv = RunReportRequest(
+        req_prev = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=prev_start, end_date=prev_end)],
             dimensions=[Dimension(name="pageTitle")],
             metrics=[Metric(name="screenPageViews")],
             limit=3000
         )
-        res_prev_pv = client.run_report(req_prev_pv)
-        if res_prev_pv.rows:
-            for row in res_prev_pv.rows:
+        res_prev = client.run_report(req_prev)
+        if res_prev.rows:
+            for row in res_prev.rows:
                 prev_pv_map[row.dimension_values[0].value] = int(row.metric_values[0].value)
     except: pass
 
-    # 集計
-    df_grouped = df_curr.groupby("title")["pv"].sum().reset_index().rename(columns={"pv": "今期のPV"})
-    df_grouped["前期のPV"] = df_grouped["title"].map(prev_pv_map).fillna(0).astype(int)
+    # ------------------------------------------------
+    # Step 5. データの結合 (Merge)
+    # ------------------------------------------------
     
-    df_grouped["差分"] = df_grouped["今期のPV"] - df_grouped["前期のPV"]
+    # 前期PV結合
+    df_base["前期のPV"] = df_base["title"].map(prev_pv_map).fillna(0).astype(int)
+    
+    # 差分計算
+    df_base["差分"] = df_base["pv"] - df_base["前期のPV"]
     def calc_pct(row):
         if row["前期のPV"] > 0: return f"{(row['差分'] / row['前期のPV'] * 100):+.1f}%"
-        elif row["今期のPV"] > 0: return "NEW"
+        elif row["pv"] > 0: return "NEW"
         else: return "0%"
-    df_grouped["前期間比"] = df_grouped.apply(calc_pct, axis=1)
+    df_base["前期間比"] = df_base.apply(calc_pct, axis=1)
 
-    # 詳細カラム生成
-    def format_mixed_info(title):
-        rows = df_curr[df_curr["title"] == title]
-        top_items = rows.groupby("info")[["pv", "rank", "is_kw"]].max().sort_values("pv", ascending=False).head(3)
-        res = []
-        for info, row in top_items.iterrows():
-            if row["is_kw"]:
-                kw = info
-                cr = row["rank"]
-                pr = prev_rank_map.get((title, kw), 0)
-                rank_str = f"{cr:.1f}位"
-                if pr > 0:
-                    diff = pr - cr
-                    if diff > 0: rank_str += f"(⬆{diff:.1f})"
-                    elif diff < 0: rank_str += f"(⬇{abs(diff):.1f})"
-                else: rank_str += "(NEW)"
-                res.append(f"{kw}: {rank_str}")
-            else:
-                res.append(f"{info}")
-        return " | ".join(res)
+    # 詳細情報（キーワード優先、無ければ流入元）を結合
+    def resolve_info(title):
+        # 1. キーワードマップにあるか？
+        if title in kw_map:
+            return kw_map[title]
+        # 2. なければ流入元マップにあるか？
+        elif title in source_map:
+            return source_map[title]
+        # 3. どちらもなければハイフン
+        else:
+            return "-"
 
-    # カラム名を決定
-    col_name = "検索キーワード(TOP3)" if keyword_mode else "主な流入元(Search Console未連携)"
-    df_grouped[col_name] = df_grouped["title"].apply(format_mixed_info)
+    df_base["検索キーワード / 流入元"] = df_base["title"].apply(resolve_info)
+
+    # 最終整形
+    final = df_base.sort_values("pv", ascending=False).head(30)
+    final = final[["title", "pv", "前期のPV", "前期間比", "検索キーワード / 流入元"]]
+    final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
     
-    final = df_grouped.sort_values("今期のPV", ascending=False).head(30)
-    final = final[["title", "今期のPV", "前期のPV", "前期間比", col_name]].rename(columns={"title": "記事タイトル"})
     return final
 
 # ④ SNS流入分析
@@ -378,8 +378,8 @@ with tab2:
                     st.line_chart(df_trend, color=["#FF4B4B", "#CCCCCC"]) 
                     st.caption("赤線: 今期 / グレー線: 前期")
                 
-                # ランキング (自動修復版)
-                df_top = get_article_ranking_comparison(blog["id"], period_days)
+                # ランキング (リクエスト分離方式)
+                df_top = get_article_ranking_separated(blog["id"], period_days)
                 if not df_top.empty:
                     st.markdown("#### 🏆 記事別ランキング TOP30")
                     st.dataframe(df_top, use_container_width=True, hide_index=True, height=600)

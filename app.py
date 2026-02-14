@@ -148,7 +148,7 @@ def get_daily_trend_comparison(property_id, days):
     except Exception:
         return pd.DataFrame(), 0, 0
 
-# Search Consoleから検索キーワードを取得
+# Search Consoleから検索キーワードを取得（全デバイス）
 @st.cache_data(ttl=3600)
 def get_search_console_keywords(site_url, days):
     try:
@@ -195,6 +195,63 @@ def get_search_console_keywords(site_url, days):
             kws_sorted = sorted(kws, key=lambda x: x['clicks'], reverse=True)
             top_kws = kws_sorted[:5]
             final_map[path] = " | ".join([f"{item['query']}({item['clicks']})" for item in top_kws])
+            
+        return final_map, None 
+    
+    except Exception as e:
+        return {}, str(e)
+
+
+# ★ 新規追加：モバイル検索に限定して、検索順位（ポジション）を取得する関数
+@st.cache_data(ttl=3600)
+def get_mobile_search_ranking(site_url, days):
+    try:
+        creds_json = json.loads(st.secrets["gcp_service_account"])
+        sc_creds = service_account.Credentials.from_service_account_info(
+            creds_json, 
+            scopes=['https://www.googleapis.com/auth/webmasters.readonly']
+        )
+        sc_service = build('searchconsole', 'v1', credentials=sc_creds)
+        
+        end_date = (datetime.now(JST) - timedelta(days=1)).strftime('%Y-%m-%d')
+        start_date = (datetime.now(JST) - timedelta(days=days+1)).strftime('%Y-%m-%d')
+        
+        # device = MOBILE でフィルタリング
+        request = {
+            'startDate': start_date,
+            'endDate': end_date,
+            'dimensions': ['page', 'query'],
+            'dimensionFilterGroups': [{
+                'filters': [{'dimension': 'device', 'operator': 'equals', 'expression': 'MOBILE'}]
+            }],
+            'rowLimit': 10000
+        }
+        
+        property_uri = f"sc-domain:{site_url}"
+        try:
+            response = sc_service.searchanalytics().query(siteUrl=property_uri, body=request).execute()
+        except Exception:
+            property_uri = f"https://{site_url}/"
+            response = sc_service.searchanalytics().query(siteUrl=property_uri, body=request).execute()
+            
+        rows = response.get('rows', [])
+        kw_map = {}
+        for row in rows:
+            page_url = row['keys'][0]
+            query = row['keys'][1]
+            clicks = row['clicks']
+            position = row['position'] # ★順位を取得
+            
+            if clicks > 0:
+                if page_url not in kw_map:
+                    kw_map[page_url] = []
+                kw_map[page_url].append({"query": query, "clicks": clicks, "position": position})
+                
+        final_map = {}
+        for page_url, kws in kw_map.items():
+            path = urllib.parse.urlparse(page_url).path
+            kws_sorted = sorted(kws, key=lambda x: x['clicks'], reverse=True)
+            final_map[path] = kws_sorted[:3] # 上位3キーワードのみ抽出
             
         return final_map, None 
     
@@ -296,7 +353,6 @@ def get_article_ranking_raw(property_id, site_url, days):
     df_final["前期間比"] = df_final.apply(calc_pct, axis=1)
 
     df_final["推移"] = df_final["title"].map(trend_map)
-    
     df_final["上昇推移"] = df_final.apply(lambda r: r["推移"] if r["差分"] >= 0 else None, axis=1)
     df_final["下落推移"] = df_final.apply(lambda r: r["推移"] if r["差分"] < 0 else None, axis=1)
 
@@ -316,9 +372,11 @@ def get_article_ranking_raw(property_id, site_url, days):
     df_final["主な流入元"] = df_final.apply(resolve_source, axis=1)
     
     final = df_final.sort_values("pv", ascending=False).head(50)
-    final = final[["title", "pv", "前期のPV", "前期間比", "上昇推移", "下落推移", "検索キーワード", "主な流入元"]]
+    # ★ 順位分析でパスを使うため "path" も残す
+    final = final[["title", "path", "pv", "前期のPV", "前期間比", "上昇推移", "下落推移", "検索キーワード", "主な流入元"]]
     final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
     return final, sc_error, trend_map
+
 
 # ④ SNS流入分析
 @st.cache_data(ttl=1800)
@@ -364,7 +422,12 @@ def get_sns_traffic_safe(property_id, domain, days=7):
 # ---------------------------------------------------------
 st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-tab1, tab2, tab3 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入"])
+# ★ 期間選択をタブの上に移動（レポートと順位分析で連動）
+col_sel, _ = st.columns([1, 4])
+with col_sel:
+    period_days = st.selectbox("📅 分析期間 (レポート・順位分析用)", [3, 7, 14, 30], index=3, format_func=lambda x: f"過去 {x} 日間")
+
+tab1, tab2, tab3, tab4 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入", "🔍 検索順位・競合分析"])
 
 with tab1:
     cols = st.columns(3)
@@ -384,18 +447,12 @@ with tab1:
 
 with tab2:
     st.markdown("### 📈 期間比較レポート")
-    col_sel, _ = st.columns([1, 2])
-    with col_sel:
-        period_days = st.selectbox("分析期間", [3, 7, 14, 30], index=3, format_func=lambda x: f"過去 {x} 日間")
-    
     for blog in BLOGS:
         with st.expander(f"📊 {blog['name']} の詳細分析", expanded=True):
             try:
-                # データの取得
                 df_trend, curr_sum, prev_sum = get_daily_trend_comparison(blog["id"], period_days)
                 df_top, sc_error, trend_map = get_article_ranking_raw(blog["id"], blog["url"], period_days)
                 
-                # 1つ目のメイングラフ：総PVの推移
                 diff_total = curr_sum - prev_sum
                 pct_total = (diff_total / prev_sum * 100) if prev_sum > 0 else 0
                 st.markdown(f"#### 📅 総PV: {curr_sum:,} ({pct_total:+.1f}%)")
@@ -404,14 +461,9 @@ with tab2:
                     st.line_chart(df_trend, color=["#FF4B4B", "#CCCCCC"]) 
                     st.caption("赤線: 今期 / グレー線: 前期")
 
-                # 2つ目のメイングラフ：TOP50記事のPV推移
                 if not df_top.empty and not df_trend.empty:
-                    # df_trendのインデックス（日付）を利用して空のデータフレームを作成
                     df_article_trend = pd.DataFrame(index=df_trend.index)
-                    
-                    # ランキングの順位に合わせて各記事のデータを列として追加
                     for i, title in enumerate(df_top["記事タイトル"]):
-                        # 凡例が長くなりすぎないように15文字でカット
                         short_title = title[:15] + "..." if len(title) > 15 else title
                         col_name = f"{i+1}位: {short_title}"
                         
@@ -438,6 +490,7 @@ with tab2:
                         df_top, 
                         column_config={
                             "記事タイトル": st.column_config.TextColumn("記事タイトル", width="medium"),
+                            "path": None, # ★ path列は裏で持っておき、表示は隠す
                             "上昇推移": st.column_config.LineChartColumn("上昇 📈", y_min=0, color="#FF4B4B"),
                             "下落推移": st.column_config.LineChartColumn("下落 📉", y_min=0, color="#1E88E5"),
                             "検索キーワード": st.column_config.TextColumn("検索キーワード", width="large"),
@@ -477,3 +530,69 @@ with tab3:
                 c1, c2 = st.columns(2)
                 c1.link_button("X(Twitter)反応", f"https://search.yahoo.co.jp/realtime/search?p={q}")
                 c2.link_button("SNS全体Google検索", f"https://www.google.com/search?q=site:x.com+{q}+OR+site:facebook.com+{q}")
+
+# ★ 新規追加タブ：検索順位・競合分析
+with tab4:
+    st.markdown("### 🔍 検索順位・競合分析（モバイル検索）")
+    st.info("💡 **データの取得方法について:** \nプログラムから直接Google検索を大量に行うと、Googleから即座にIPブロック（スパム判定）を受けてしまいます。そのため、最も安全で正確な **Google Search Consoleの実データ（実際のモバイル検索での平均掲載順位）** を利用しています。")
+    
+    for blog in BLOGS:
+        with st.expander(f"🏆 {blog['name']} - 流入上位キーワードの検索順位", expanded=True):
+            try:
+                # 期間分析と同じTOP50のデータを取得
+                df_top, _, _ = get_article_ranking_raw(blog["id"], blog["url"], period_days)
+                # モバイル検索の順位付きキーワードデータを取得
+                mobile_kw_map, m_error = get_mobile_search_ranking(blog["url"], period_days)
+                
+                if m_error:
+                    st.error(f"Search Consoleエラー: {m_error}")
+                
+                if not df_top.empty:
+                    rank_list = []
+                    # TOP50記事についてループ
+                    for i, row in df_top.iterrows():
+                        title = row["記事タイトル"]
+                        path = str(row["path"]).split('?')[0]
+                        pv = row["今期のPV"]
+                        
+                        # 該当記事のキーワードリストを取得
+                        kws = mobile_kw_map.get(path, [])
+                        kw1 = kws[0] if len(kws) > 0 else None
+                        kw2 = kws[1] if len(kws) > 1 else None
+                        kw3 = kws[2] if len(kws) > 2 else None
+                        
+                        def format_kw(k):
+                            if not k: return "-"
+                            pos = round(k["position"], 1)
+                            # 50位までを表示、それ以降は「50位圏外」
+                            pos_str = f"{pos}位" if pos <= 50 else "50位圏外"
+                            return f"{k['query']} ({pos_str})"
+
+                        rank_list.append({
+                            "記事タイトル": title,
+                            "今期のPV": pv,
+                            "No.1 キーワード": format_kw(kw1),
+                            "No.2 キーワード": format_kw(kw2),
+                            "No.3 キーワード": format_kw(kw3),
+                        })
+                    
+                    df_rank = pd.DataFrame(rank_list)
+                    
+                    # 検索順位の表を表示
+                    st.dataframe(
+                        df_rank,
+                        column_config={
+                            "記事タイトル": st.column_config.TextColumn("記事タイトル", width="medium"),
+                            "今期のPV": st.column_config.NumberColumn("今期のPV"),
+                            "No.1 キーワード": st.column_config.TextColumn("No.1 キーワード (順位)", width="medium"),
+                            "No.2 キーワード": st.column_config.TextColumn("No.2 キーワード (順位)", width="medium"),
+                            "No.3 キーワード": st.column_config.TextColumn("No.3 キーワード (順位)", width="medium"),
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        height=800
+                    )
+                else:
+                    st.warning("データがありません")
+            except Exception as e:
+                st.error(f"エラー: {e}")

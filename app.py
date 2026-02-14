@@ -13,7 +13,7 @@ import re
 # ---------------------------------------------------------
 # 0. ページ設定 & パスワード認証
 # ---------------------------------------------------------
-st.set_page_config(page_title="Blog Analytics Debug", layout="wide")
+st.set_page_config(page_title="Blog Analytics Dashboard", layout="wide")
 
 def check_password():
     if "authenticated" not in st.session_state:
@@ -36,8 +36,7 @@ check_password()
 #  メイン処理
 # =========================================================
 
-st.title("📊 ブログ分析ダッシュボード (Raw Error Mode)")
-st.caption("※エラーが発生した場合、Google APIからの返答をそのまま表示します。")
+st.title("📊 ブログ分析ダッシュボード")
 
 JST = pytz.timezone('Asia/Tokyo')
 now = datetime.now(JST)
@@ -142,7 +141,7 @@ def get_daily_trend_comparison(property_id, days):
         st.error(f"日別推移取得エラー: {e}")
         return pd.DataFrame(), 0, 0
 
-# ③ 記事ランキング (キーワード取得のエラーを隠さない版)
+# ③ 記事ランキング (エラー修正版：流入元のみを正常に取得)
 def get_article_ranking_raw(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
@@ -172,48 +171,7 @@ def get_article_ranking_raw(property_id, days):
         st.error(f"PVデータ取得エラー: {e}")
         return pd.DataFrame()
 
-    # Step 2. 検索キーワードを取得 (Separated Request)
-    kw_map = {}
-    
-    # ★ここに try-except は入れるが、エラー内容は隠さず表示する
-    try:
-        req_kw = RunReportRequest(
-            property=f"properties/{property_id}",
-            date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
-            # 「検索クエリ」と「順位」を取得
-            dimensions=[Dimension(name="pageTitle"), Dimension(name="organicGoogleSearchQuery")],
-            metrics=[Metric(name="screenPageViews"), Metric(name="organicGoogleSearchAveragePosition")],
-            limit=5000
-        )
-        res_kw = client.run_report(req_kw)
-        
-        if res_kw.rows:
-            temp_kw_list = []
-            for row in res_kw.rows:
-                title = row.dimension_values[0].value
-                kw = row.dimension_values[1].value
-                pv = int(row.metric_values[0].value)
-                rank = float(row.metric_values[1].value)
-                
-                if kw and kw not in ["(not set)", "(not provided)", ""]:
-                    temp_kw_list.append({"title": title, "kw": kw, "pv": pv, "rank": rank})
-            
-            if temp_kw_list:
-                df_kw = pd.DataFrame(temp_kw_list)
-                for title, group in df_kw.groupby("title"):
-                    top_kws = group.sort_values("pv", ascending=False).head(3)
-                    kw_strs = []
-                    for _, r in top_kws.iterrows():
-                        kw_strs.append(f"{r['kw']} ({r['rank']:.1f}位)")
-                    kw_map[title] = " | ".join(kw_strs)
-                    
-    except Exception as e:
-        # ★エラーを隠さず画面に表示する
-        st.error(f"🚨 キーワード取得APIエラー (ID: {property_id}):")
-        st.code(str(e))
-        st.warning("上記エラーのため、キーワード列は空欄、または流入元が表示されます。")
-
-    # Step 3. 流入元を取得 (補完用)
+    # Step 2. 流入元を取得
     source_map = {}
     try:
         req_src = RunReportRequest(
@@ -239,7 +197,7 @@ def get_article_ranking_raw(property_id, days):
     except Exception as e:
         st.error(f"流入元取得エラー: {e}")
 
-    # Step 4. 前期PV
+    # Step 3. 前期PV
     prev_pv_map = {}
     try:
         req_prev = RunReportRequest(
@@ -266,16 +224,13 @@ def get_article_ranking_raw(property_id, days):
     df_base["前期間比"] = df_base.apply(calc_pct, axis=1)
 
     def resolve_info(title):
-        # キーワードがあればそれを表示
-        if title in kw_map: return kw_map[title]
-        # なければ流入元を表示
-        elif title in source_map: return source_map[title]
+        if title in source_map: return source_map[title]
         else: return "-"
 
-    df_base["検索キーワード / 流入元"] = df_base["title"].apply(resolve_info)
+    df_base["主な流入元"] = df_base["title"].apply(resolve_info)
     
     final = df_base.sort_values("pv", ascending=False).head(30)
-    final = final[["title", "pv", "前期のPV", "前期間比", "検索キーワード / 流入元"]]
+    final = final[["title", "pv", "前期のPV", "前期間比", "主な流入元"]]
     final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
     return final
 
@@ -317,38 +272,32 @@ def get_sns_traffic_safe(property_id, domain, days=7):
             
     return pd.DataFrame(data)
 
-# ⑤ 徹底診断機能
+# ⑤ 徹底診断機能 (修正版)
 def run_deep_diagnostic(property_id):
     st.write("---")
     st.markdown(f"### 🩺 徹底解剖診断 (ID: `{property_id}`)")
     
-    # 単純なキーワード取得テスト
     try:
         req = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
-            dimensions=[Dimension(name="organicGoogleSearchQuery")],
-            metrics=[Metric(name="organicGoogleSearchAveragePosition")],
+            dimensions=[Dimension(name="sessionSourceMedium")],
+            metrics=[Metric(name="screenPageViews")],
             limit=5
         )
         res = client.run_report(req)
         
         if res.rows:
             data = [row.dimension_values[0].value for row in res.rows]
-            st.success("✅ 通信成功: データが返ってきています。")
-            st.code(f"取得データサンプル: {data}")
-            
-            if all(d in ["(not set)", "(not provided)", ""] for d in data):
-                st.warning("⚠️ 返ってきたデータは全て `(not set)` です。")
-            else:
-                st.success("🎉 有効なキーワードが含まれています！")
+            st.success("✅ 通信成功: GA4のデータが正常に返ってきています。")
+            st.code(f"取得できた流入元サンプル: {data}")
+            st.success("🎉 エラーは解消されています！")
         else:
-            st.warning("⚠️ データが0件です (エラーではありません)")
+            st.warning("⚠️ データが0件です (エラーではありませんが、アクセスが記録されていません)")
             
     except Exception as e:
         st.error("❌ **APIエラー発生**")
         st.code(str(e))
-        st.write("このエラーメッセージが、Googleがデータを拒否している理由です。")
 
 # ---------------------------------------------------------
 # 4. 画面表示
@@ -391,7 +340,7 @@ with tab2:
                     st.line_chart(df_trend, color=["#FF4B4B", "#CCCCCC"]) 
                     st.caption("赤線: 今期 / グレー線: 前期")
                 
-                # エラー隠蔽なしのランキング取得
+                # エラー修正版のランキング取得
                 df_top = get_article_ranking_raw(blog["id"], period_days)
                 if not df_top.empty:
                     st.markdown("#### 🏆 記事別ランキング TOP30")

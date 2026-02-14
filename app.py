@@ -100,7 +100,7 @@ def get_realtime_metrics(property_id):
     except Exception:
         return 0, 0, 0
 
-# ② 日別推移グラフ（横軸を日付に変更）
+# ② 日別推移グラフ
 @st.cache_data(ttl=1800)
 def get_daily_trend_comparison(property_id, days):
     current_start = f"{days}daysAgo"
@@ -128,19 +128,18 @@ def get_daily_trend_comparison(property_id, days):
         res_prev = client.run_report(req_prev)
 
         curr_data = []
-        curr_dates = [] # 横軸用の日付リスト
+        curr_dates = [] 
         if res_curr.rows:
             for row in res_curr.rows:
                 curr_data.append(int(row.metric_values[0].value))
-                d = row.dimension_values[0].value  # 例: '20260201'
-                curr_dates.append(f"{d[4:6]}/{d[6:8]}") # '02/01' の形式に変換
+                d = row.dimension_values[0].value  
+                curr_dates.append(f"{d[4:6]}/{d[6:8]}") 
 
         prev_data = [int(row.metric_values[0].value) for row in res_prev.rows] if res_prev.rows else []
 
         min_len = min(len(curr_data), len(prev_data))
         if min_len == 0: return pd.DataFrame(), sum(curr_data), sum(prev_data)
 
-        # インデックスに日付をセット
         df = pd.DataFrame(index=curr_dates[:min_len])
         df["今期総PV"] = curr_data[:min_len]
         df["前期総PV"] = prev_data[:min_len]
@@ -298,7 +297,6 @@ def get_article_ranking_raw(property_id, site_url, days):
 
     df_final["推移"] = df_final["title"].map(trend_map)
     
-    # ★ ここがプロの工夫：上昇と下落で列を分け、該当しない方はNoneにする
     df_final["上昇推移"] = df_final.apply(lambda r: r["推移"] if r["差分"] >= 0 else None, axis=1)
     df_final["下落推移"] = df_final.apply(lambda r: r["推移"] if r["差分"] < 0 else None, axis=1)
 
@@ -318,7 +316,6 @@ def get_article_ranking_raw(property_id, site_url, days):
     df_final["主な流入元"] = df_final.apply(resolve_source, axis=1)
     
     final = df_final.sort_values("pv", ascending=False).head(50)
-    # 表示用の列に絞り込み
     final = final[["title", "pv", "前期のPV", "前期間比", "上昇推移", "下落推移", "検索キーワード", "主な流入元"]]
     final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
     return final, sc_error, trend_map
@@ -398,36 +395,36 @@ with tab2:
                 df_trend, curr_sum, prev_sum = get_daily_trend_comparison(blog["id"], period_days)
                 df_top, sc_error, trend_map = get_article_ranking_raw(blog["id"], blog["url"], period_days)
                 
-                # ★ メイングラフにTOP10記事の推移を合流させる
-                if not df_top.empty and not df_trend.empty:
-                    top10_titles = df_top.head(10)["記事タイトル"].tolist()
-                    for i, title in enumerate(top10_titles):
-                        # 凡例が長くなりすぎないように15文字でカット
-                        short_title = title[:15] + "..." if len(title) > 15 else title
-                        col_name = f"TOP{i+1}: {short_title}"
-                        
-                        trend_data = trend_map.get(title, [])
-                        # 長さが足りない場合は0で埋める
-                        if len(trend_data) < len(df_trend):
-                            trend_data = trend_data + [0] * (len(df_trend) - len(trend_data))
-                        
-                        df_trend[col_name] = trend_data[:len(df_trend)]
-
-                # 総PVとグラフの描画
+                # 1つ目のメイングラフ：総PVの推移
                 diff_total = curr_sum - prev_sum
                 pct_total = (diff_total / prev_sum * 100) if prev_sum > 0 else 0
                 st.markdown(f"#### 📅 総PV: {curr_sum:,} ({pct_total:+.1f}%)")
                 
                 if not df_trend.empty:
-                    # カスタムカラーリスト (総PVは赤とグレー、TOP10記事には他の色を割り当て)
-                    chart_colors = ["#FF4B4B", "#CCCCCC"] + [
-                        "#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b",
-                        "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#f1c40f"
-                    ][:len(df_trend.columns)-2]
+                    st.line_chart(df_trend, color=["#FF4B4B", "#CCCCCC"]) 
+                    st.caption("赤線: 今期 / グレー線: 前期")
+
+                # 2つ目のメイングラフ：TOP50記事のPV推移
+                if not df_top.empty and not df_trend.empty:
+                    # df_trendのインデックス（日付）を利用して空のデータフレームを作成
+                    df_article_trend = pd.DataFrame(index=df_trend.index)
                     
-                    st.line_chart(df_trend, color=chart_colors) 
-                    st.caption("※ 上部の線が「今期」と「前期」の総PV。下部の線がTOP10記事それぞれの寄与PVです。クリックで凡例をオンオフできます。")
-                
+                    # ランキングの順位に合わせて各記事のデータを列として追加
+                    for i, title in enumerate(df_top["記事タイトル"]):
+                        # 凡例が長くなりすぎないように15文字でカット
+                        short_title = title[:15] + "..." if len(title) > 15 else title
+                        col_name = f"{i+1}位: {short_title}"
+                        
+                        trend_data = trend_map.get(title, [])
+                        if len(trend_data) < len(df_trend):
+                            trend_data = trend_data + [0] * (len(df_trend) - len(trend_data))
+                        
+                        df_article_trend[col_name] = trend_data[:len(df_trend)]
+                    
+                    st.markdown("#### 📊 TOP50記事のPV推移")
+                    st.line_chart(df_article_trend)
+                    st.caption("※ 上位50記事の推移です。グラフ上の凡例をダブルクリックすると特定の記事だけを表示できます。")
+
                 if sc_error:
                     if "モジュール不足" in sc_error:
                         st.warning("⚠️ **キーワード表示の準備が必要です**\n\nGitHubの `requirements.txt` に `google-api-python-client` と追記してください。")
@@ -437,7 +434,6 @@ with tab2:
                 if not df_top.empty:
                     st.markdown("#### 🏆 記事別ランキング TOP50")
                     
-                    # ★ スパークラインの列を2つに分けて色を表現
                     st.dataframe(
                         df_top, 
                         column_config={

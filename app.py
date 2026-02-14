@@ -3,17 +3,17 @@ from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     RunReportRequest, DateRange, Metric, Dimension
 )
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import pytz
 import pandas as pd
 import urllib.parse
 import re
 
-# ---------------------------------------------------------
-# 0. ページ設定 & パスワード認証
-# ---------------------------------------------------------
-st.set_page_config(page_title="Blog Analytics Dashboard", layout="wide")
+# =========================================================
+#  0. ページ設定 & パスワード認証
+# =========================================================
+st.set_page_config(page_title="📊 ブログ分析ダッシュボード", layout="wide")
 
 def check_password():
     if "authenticated" not in st.session_state:
@@ -96,7 +96,6 @@ def get_realtime_metrics(property_id):
                     
         return pv_today, pv_yest_same, pv_yest_total
     except Exception as e:
-        st.error(f"リアルタイム取得エラー: {e}")
         return 0, 0, 0
 
 # ② 日別推移グラフ
@@ -138,11 +137,71 @@ def get_daily_trend_comparison(property_id, days):
         
         return df, sum(curr_data), sum(prev_data)
     except Exception as e:
-        st.error(f"日別推移取得エラー: {e}")
         return pd.DataFrame(), 0, 0
 
-# ③ 記事ランキング (エラー修正版：流入元のみを正常に取得)
-def get_article_ranking_raw(property_id, days):
+# ★追加：Search Consoleから検索キーワードを取得する機能
+@st.cache_data(ttl=3600)
+def get_search_console_keywords(site_url, days):
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2 import service_account
+        
+        creds_json = json.loads(st.secrets["gcp_service_account"])
+        sc_creds = service_account.Credentials.from_service_account_info(
+            creds_json, 
+            scopes=['https://www.googleapis.com/auth/webmasters.readonly']
+        )
+        sc_service = build('searchconsole', 'v1', credentials=sc_creds)
+        
+        # Search Consoleは最新データが1〜2日遅れるため調整
+        end_date = (datetime.now(JST) - timedelta(days=1)).strftime('%Y-%m-%d')
+        start_date = (datetime.now(JST) - timedelta(days=days+1)).strftime('%Y-%m-%d')
+        
+        request = {
+            'startDate': start_date,
+            'endDate': end_date,
+            'dimensions': ['page', 'query'],
+            'rowLimit': 5000
+        }
+        
+        # ドメインプロパティかURLプレフィックスかを自動判別してリクエスト
+        property_uri = f"sc-domain:{site_url}"
+        try:
+            response = sc_service.searchanalytics().query(siteUrl=property_uri, body=request).execute()
+        except Exception:
+            property_uri = f"https://{site_url}/"
+            response = sc_service.searchanalytics().query(siteUrl=property_uri, body=request).execute()
+            
+        rows = response.get('rows', [])
+        
+        # ページURLごとに検索キーワードとクリック数をまとめる
+        kw_map = {}
+        for row in rows:
+            page_url = row['keys'][0]
+            query = row['keys'][1]
+            clicks = row['clicks']
+            
+            if clicks > 0:
+                if page_url not in kw_map:
+                    kw_map[page_url] = []
+                kw_map[page_url].append(f"{query}({clicks}回)")
+                
+        # 各ページのキーワード上位3つを「 | 」で結合
+        final_map = {}
+        for page_url, kws in kw_map.items():
+            path = urllib.parse.urlparse(page_url).path
+            final_map[path] = " | ".join(kws[:3])
+            
+        return final_map, None 
+    
+    except ImportError:
+        return {}, "モジュール不足"
+    except Exception as e:
+        return {}, str(e)
+
+
+# ③ 記事ランキング
+def get_article_ranking_raw(property_id, site_url, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
     prev_start = f"{days*2}daysAgo"
@@ -153,25 +212,26 @@ def get_article_ranking_raw(property_id, days):
         req_pv = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
-            dimensions=[Dimension(name="pageTitle")],
+            dimensions=[Dimension(name="pageTitle"), Dimension(name="pagePath")],
             metrics=[Metric(name="screenPageViews")],
             limit=3000
         )
         res_pv = client.run_report(req_pv)
-        if not res_pv.rows: return pd.DataFrame()
+        if not res_pv.rows: return pd.DataFrame(), None
 
         base_data = []
         for row in res_pv.rows:
             base_data.append({
                 "title": row.dimension_values[0].value,
+                "path": row.dimension_values[1].value,
                 "pv": int(row.metric_values[0].value)
             })
         df_base = pd.DataFrame(base_data)
     except Exception as e:
         st.error(f"PVデータ取得エラー: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
-    # Step 2. 流入元を取得
+    # Step 2. 流入元を取得 (キーワードが取れなかった時の予備)
     source_map = {}
     try:
         req_src = RunReportRequest(
@@ -194,10 +254,13 @@ def get_article_ranking_raw(property_id, days):
             for title, group in df_src.groupby("title"):
                 top_srcs = group.sort_values("pv", ascending=False).head(3)["source"].tolist()
                 source_map[title] = " | ".join([f"[{s}]" for s in top_srcs])
-    except Exception as e:
-        st.error(f"流入元取得エラー: {e}")
+    except Exception:
+        pass
 
-    # Step 3. 前期PV
+    # Step 3. Search Console APIから検索キーワードを取得
+    kw_map, sc_error = get_search_console_keywords(site_url, days)
+
+    # Step 4. 前期PV
     prev_pv_map = {}
     try:
         req_prev = RunReportRequest(
@@ -214,25 +277,34 @@ def get_article_ranking_raw(property_id, days):
     except Exception:
         pass
 
-    # 結合
-    df_base["前期のPV"] = df_base["title"].map(prev_pv_map).fillna(0).astype(int)
-    df_base["差分"] = df_base["pv"] - df_base["前期のPV"]
+    # 結合・集計処理
+    df_final = df_base.groupby("title").agg({"pv": "sum", "path": "first"}).reset_index()
+    df_final["前期のPV"] = df_final["title"].map(prev_pv_map).fillna(0).astype(int)
+    df_final["差分"] = df_final["pv"] - df_final["前期のPV"]
+    
     def calc_pct(row):
         if row["前期のPV"] > 0: return f"{(row['差分'] / row['前期のPV'] * 100):+.1f}%"
         elif row["pv"] > 0: return "NEW"
         else: return "0%"
-    df_base["前期間比"] = df_base.apply(calc_pct, axis=1)
+    df_final["前期間比"] = df_final.apply(calc_pct, axis=1)
 
-    def resolve_info(title):
-        if title in source_map: return source_map[title]
-        else: return "-"
+    def resolve_info(row):
+        path = str(row["path"]).split('?')[0]
+        title = row["title"]
+        # キーワードがあれば優先表示、なければ流入元
+        if path in kw_map and kw_map[path]:
+            return f"🔑 {kw_map[path]}"
+        elif title in source_map:
+            return source_map[title]
+        return "-"
 
-    df_base["主な流入元"] = df_base["title"].apply(resolve_info)
+    df_final["検索キーワード / 主な流入元"] = df_final.apply(resolve_info, axis=1)
     
-    final = df_base.sort_values("pv", ascending=False).head(30)
-    final = final[["title", "pv", "前期のPV", "前期間比", "主な流入元"]]
+    # ★TOP50に変更
+    final = df_final.sort_values("pv", ascending=False).head(50)
+    final = final[["title", "pv", "前期のPV", "前期間比", "検索キーワード / 主な流入元"]]
     final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
-    return final
+    return final, sc_error
 
 # ④ SNS流入分析
 def get_sns_traffic_safe(property_id, domain, days=7):
@@ -247,7 +319,6 @@ def get_sns_traffic_safe(property_id, domain, days=7):
         )
         response = client.run_report(request)
     except Exception as e:
-        st.error(f"SNSデータ取得エラー: {e}")
         return pd.DataFrame()
 
     data = []
@@ -272,39 +343,13 @@ def get_sns_traffic_safe(property_id, domain, days=7):
             
     return pd.DataFrame(data)
 
-# ⑤ 徹底診断機能 (修正版)
-def run_deep_diagnostic(property_id):
-    st.write("---")
-    st.markdown(f"### 🩺 徹底解剖診断 (ID: `{property_id}`)")
-    
-    try:
-        req = RunReportRequest(
-            property=f"properties/{property_id}",
-            date_ranges=[DateRange(start_date="30daysAgo", end_date="today")],
-            dimensions=[Dimension(name="sessionSourceMedium")],
-            metrics=[Metric(name="screenPageViews")],
-            limit=5
-        )
-        res = client.run_report(req)
-        
-        if res.rows:
-            data = [row.dimension_values[0].value for row in res.rows]
-            st.success("✅ 通信成功: GA4のデータが正常に返ってきています。")
-            st.code(f"取得できた流入元サンプル: {data}")
-            st.success("🎉 エラーは解消されています！")
-        else:
-            st.warning("⚠️ データが0件です (エラーではありませんが、アクセスが記録されていません)")
-            
-    except Exception as e:
-        st.error("❌ **APIエラー発生**")
-        st.code(str(e))
 
 # ---------------------------------------------------------
 # 4. 画面表示
 # ---------------------------------------------------------
 st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-tab1, tab2, tab3, tab4 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入", "🛠️ 徹底診断"])
+tab1, tab2, tab3 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入"])
 
 with tab1:
     cols = st.columns(3)
@@ -326,8 +371,8 @@ with tab2:
     st.markdown("### 📈 期間比較レポート")
     col_sel, _ = st.columns([1, 2])
     with col_sel:
-        # 30日をデフォルトに
-        period_days = st.selectbox("分析期間", [7, 30], index=1, format_func=lambda x: f"過去 {x} 日間")
+        # ★ 3, 7, 14, 30 から選べるように変更
+        period_days = st.selectbox("分析期間", [3, 7, 14, 30], index=3, format_func=lambda x: f"過去 {x} 日間")
     
     for blog in BLOGS:
         with st.expander(f"📊 {blog['name']} の詳細分析", expanded=True):
@@ -340,11 +385,19 @@ with tab2:
                     st.line_chart(df_trend, color=["#FF4B4B", "#CCCCCC"]) 
                     st.caption("赤線: 今期 / グレー線: 前期")
                 
-                # エラー修正版のランキング取得
-                df_top = get_article_ranking_raw(blog["id"], period_days)
+                # ★ ランキング取得 (sc_errorも受け取る)
+                df_top, sc_error = get_article_ranking_raw(blog["id"], blog["url"], period_days)
+                
+                # キーワード取得に関するエラーを検知した場合に警告を表示
+                if sc_error:
+                    if "モジュール不足" in sc_error:
+                        st.warning("⚠️ **キーワードを表示するための準備が必要です**\n\nGitHubの `requirements.txt` を開き、一番下に `google-api-python-client` と追記して保存してください。")
+                    elif "403" in sc_error or "Permission denied" in sc_error or "User does not have sufficient permission" in sc_error:
+                        st.warning(f"⚠️ **サーチコンソールとの連携設定が未完了です**\n\nGoogleサーチコンソールの「設定 ＞ ユーザーと権限」を開き、GCPのサービスアカウント（GA4の連携に使ったメールアドレス）を「閲覧者」として追加してください。")
+                
                 if not df_top.empty:
-                    st.markdown("#### 🏆 記事別ランキング TOP30")
-                    st.dataframe(df_top, use_container_width=True, hide_index=True, height=600)
+                    st.markdown("#### 🏆 記事別ランキング TOP50")
+                    st.dataframe(df_top, use_container_width=True, hide_index=True, height=800)
                 else:
                     st.warning("データなし")
             except Exception as e:
@@ -375,10 +428,3 @@ with tab3:
                 c1, c2 = st.columns(2)
                 c1.link_button("X(Twitter)反応", f"https://search.yahoo.co.jp/realtime/search?p={q}")
                 c2.link_button("SNS全体Google検索", f"https://www.google.com/search?q=site:x.com+{q}+OR+site:facebook.com+{q}")
-
-with tab4:
-    st.markdown("### 🛠️ 徹底診断")
-    selected_blog = st.selectbox("診断するブログを選択", [b["name"] for b in BLOGS])
-    if st.button("診断開始"):
-        target_id = next(b["id"] for b in BLOGS if b["name"] == selected_blog)
-        run_deep_diagnostic(target_id)

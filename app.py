@@ -3,6 +3,8 @@ from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     RunReportRequest, DateRange, Metric, Dimension
 )
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
 from datetime import datetime, timedelta
 import json
 import pytz
@@ -65,7 +67,7 @@ BLOGS = [
 # 3. データ取得ロジック
 # ---------------------------------------------------------
 
-# ① リアルタイムPV
+# ① リアルタイムPV (キャッシュなし)
 def get_realtime_metrics(property_id):
     try:
         req_today = RunReportRequest(
@@ -95,10 +97,11 @@ def get_realtime_metrics(property_id):
                     pv_yest_same += pv
                     
         return pv_today, pv_yest_same, pv_yest_total
-    except Exception as e:
+    except Exception:
         return 0, 0, 0
 
-# ② 日別推移グラフ
+# ② 日別推移グラフ (爆速化のためキャッシュ追加)
+@st.cache_data(ttl=1800)
 def get_daily_trend_comparison(property_id, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
@@ -136,16 +139,13 @@ def get_daily_trend_comparison(property_id, days):
         })
         
         return df, sum(curr_data), sum(prev_data)
-    except Exception as e:
+    except Exception:
         return pd.DataFrame(), 0, 0
 
 # ★Search Consoleから検索キーワードを取得する機能
 @st.cache_data(ttl=3600)
 def get_search_console_keywords(site_url, days):
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2 import service_account
-        
         creds_json = json.loads(st.secrets["gcp_service_account"])
         sc_creds = service_account.Credentials.from_service_account_info(
             creds_json, 
@@ -181,29 +181,23 @@ def get_search_console_keywords(site_url, days):
             if clicks > 0:
                 if page_url not in kw_map:
                     kw_map[page_url] = []
-                # 辞書型でキーワードとクリック数を保持
                 kw_map[page_url].append({"query": query, "clicks": clicks})
                 
         final_map = {}
         for page_url, kws in kw_map.items():
             path = urllib.parse.urlparse(page_url).path
-            
-            # ★クリック数が多い順にソート（数が多い順）
             kws_sorted = sorted(kws, key=lambda x: x['clicks'], reverse=True)
-            
-            # 上位5個までを「 | 」で繋ぐ
             top_kws = kws_sorted[:5]
             final_map[path] = " | ".join([f"{item['query']}({item['clicks']})" for item in top_kws])
             
         return final_map, None 
     
-    except ImportError:
-        return {}, "モジュール不足"
     except Exception as e:
         return {}, str(e)
 
 
-# ③ 記事ランキング
+# ③ 記事ランキング (推移グラフのデータを追加 & キャッシュ化)
+@st.cache_data(ttl=1800)
 def get_article_ranking_raw(property_id, site_url, days):
     current_start = f"{days}daysAgo"
     current_end = "today"
@@ -211,12 +205,13 @@ def get_article_ranking_raw(property_id, site_url, days):
     prev_end = f"{days+1}daysAgo"
 
     try:
+        # ★ "date" ディメンションを追加して日別データを取得
         req_pv = RunReportRequest(
             property=f"properties/{property_id}",
             date_ranges=[DateRange(start_date=current_start, end_date=current_end)],
-            dimensions=[Dimension(name="pageTitle"), Dimension(name="pagePath")],
+            dimensions=[Dimension(name="pageTitle"), Dimension(name="pagePath"), Dimension(name="date")],
             metrics=[Metric(name="screenPageViews")],
-            limit=3000
+            limit=10000
         )
         res_pv = client.run_report(req_pv)
         if not res_pv.rows: return pd.DataFrame(), None
@@ -226,10 +221,23 @@ def get_article_ranking_raw(property_id, site_url, days):
             base_data.append({
                 "title": row.dimension_values[0].value,
                 "path": row.dimension_values[1].value,
+                "date": row.dimension_values[2].value,
                 "pv": int(row.metric_values[0].value)
             })
         df_base = pd.DataFrame(base_data)
-    except Exception as e:
+        
+        # 取得したデータから一意の日付リスト（昇順）を作成
+        unique_dates = sorted(list(df_base["date"].unique()))
+        
+        # 記事ごとに日別のPV推移リストを作成
+        trend_map = {}
+        for title, group in df_base.groupby("title"):
+            daily_pv = dict(zip(group["date"], group["pv"]))
+            # 日付順に並んだPVのリストを作成（アクセスがない日は0で埋める）
+            trend = [daily_pv.get(d, 0) for d in unique_dates]
+            trend_map[title] = trend
+
+    except Exception:
         return pd.DataFrame(), None
 
     source_map = {}
@@ -285,7 +293,9 @@ def get_article_ranking_raw(property_id, site_url, days):
         else: return "0%"
     df_final["前期間比"] = df_final.apply(calc_pct, axis=1)
 
-    # ★列を分ける処理
+    # ★ 期間推移のリストを列として追加
+    df_final["推移"] = df_final["title"].map(trend_map)
+
     def resolve_kw(row):
         path = str(row["path"]).split('?')[0]
         if path in kw_map and kw_map[path]:
@@ -302,12 +312,13 @@ def get_article_ranking_raw(property_id, site_url, days):
     df_final["主な流入元"] = df_final.apply(resolve_source, axis=1)
     
     final = df_final.sort_values("pv", ascending=False).head(50)
-    # ★表示する列の順番を指定
-    final = final[["title", "pv", "前期のPV", "前期間比", "検索キーワード", "主な流入元"]]
+    # ★ 推移列を含めて並び替え
+    final = final[["title", "pv", "前期のPV", "前期間比", "推移", "検索キーワード", "主な流入元"]]
     final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
     return final, sc_error
 
-# ④ SNS流入分析
+# ④ SNS流入分析 (キャッシュ追加)
+@st.cache_data(ttl=1800)
 def get_sns_traffic_safe(property_id, domain, days=7):
     start_date = f"{days}daysAgo"
     try:
@@ -319,7 +330,7 @@ def get_sns_traffic_safe(property_id, domain, days=7):
             limit=5000
         )
         response = client.run_report(request)
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
     data = []
@@ -366,6 +377,7 @@ with tab1:
             except Exception:
                 pass
     if st.button("更新", key="refresh_realtime"):
+        # キャッシュをクリアせずに再描画（リアルタイム以外はキャッシュが効く）
         st.rerun()
 
 with tab2:
@@ -396,15 +408,16 @@ with tab2:
                 if not df_top.empty:
                     st.markdown("#### 🏆 記事別ランキング TOP50")
                     
-                    # ★横スクロール可能にするため、カラム幅を設定しコンテナ幅を固定しない
+                    # ★ 推移グラフ（スパークライン）を追加して表示
                     st.dataframe(
                         df_top, 
                         column_config={
                             "記事タイトル": st.column_config.TextColumn("記事タイトル", width="medium"),
+                            "推移": st.column_config.LineChartColumn("期間推移", y_min=0), # ★ ミニグラフ
                             "検索キーワード": st.column_config.TextColumn("検索キーワード", width="large"),
                             "主な流入元": st.column_config.TextColumn("主な流入元", width="medium"),
                         },
-                        use_container_width=False,  # ここをFalseにすることで表が横に伸びてスクロールバーが出る
+                        use_container_width=False, 
                         hide_index=True, 
                         height=800
                     )

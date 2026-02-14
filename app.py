@@ -139,7 +139,7 @@ def get_daily_trend_comparison(property_id, days):
     except Exception as e:
         return pd.DataFrame(), 0, 0
 
-# ★追加：Search Consoleから検索キーワードを取得する機能
+# ★Search Consoleから検索キーワードを取得する機能
 @st.cache_data(ttl=3600)
 def get_search_console_keywords(site_url, days):
     try:
@@ -153,7 +153,6 @@ def get_search_console_keywords(site_url, days):
         )
         sc_service = build('searchconsole', 'v1', credentials=sc_creds)
         
-        # Search Consoleは最新データが1〜2日遅れるため調整
         end_date = (datetime.now(JST) - timedelta(days=1)).strftime('%Y-%m-%d')
         start_date = (datetime.now(JST) - timedelta(days=days+1)).strftime('%Y-%m-%d')
         
@@ -161,10 +160,9 @@ def get_search_console_keywords(site_url, days):
             'startDate': start_date,
             'endDate': end_date,
             'dimensions': ['page', 'query'],
-            'rowLimit': 5000
+            'rowLimit': 10000
         }
         
-        # ドメインプロパティかURLプレフィックスかを自動判別してリクエスト
         property_uri = f"sc-domain:{site_url}"
         try:
             response = sc_service.searchanalytics().query(siteUrl=property_uri, body=request).execute()
@@ -174,7 +172,6 @@ def get_search_console_keywords(site_url, days):
             
         rows = response.get('rows', [])
         
-        # ページURLごとに検索キーワードとクリック数をまとめる
         kw_map = {}
         for row in rows:
             page_url = row['keys'][0]
@@ -184,13 +181,19 @@ def get_search_console_keywords(site_url, days):
             if clicks > 0:
                 if page_url not in kw_map:
                     kw_map[page_url] = []
-                kw_map[page_url].append(f"{query}({clicks}回)")
+                # 辞書型でキーワードとクリック数を保持
+                kw_map[page_url].append({"query": query, "clicks": clicks})
                 
-        # 各ページのキーワード上位3つを「 | 」で結合
         final_map = {}
         for page_url, kws in kw_map.items():
             path = urllib.parse.urlparse(page_url).path
-            final_map[path] = " | ".join(kws[:3])
+            
+            # ★クリック数が多い順にソート（数が多い順）
+            kws_sorted = sorted(kws, key=lambda x: x['clicks'], reverse=True)
+            
+            # 上位5個までを「 | 」で繋ぐ
+            top_kws = kws_sorted[:5]
+            final_map[path] = " | ".join([f"{item['query']}({item['clicks']})" for item in top_kws])
             
         return final_map, None 
     
@@ -207,7 +210,6 @@ def get_article_ranking_raw(property_id, site_url, days):
     prev_start = f"{days*2}daysAgo"
     prev_end = f"{days+1}daysAgo"
 
-    # Step 1. まずPVベースで記事リストを取得
     try:
         req_pv = RunReportRequest(
             property=f"properties/{property_id}",
@@ -228,10 +230,8 @@ def get_article_ranking_raw(property_id, site_url, days):
             })
         df_base = pd.DataFrame(base_data)
     except Exception as e:
-        st.error(f"PVデータ取得エラー: {e}")
         return pd.DataFrame(), None
 
-    # Step 2. 流入元を取得 (キーワードが取れなかった時の予備)
     source_map = {}
     try:
         req_src = RunReportRequest(
@@ -257,10 +257,8 @@ def get_article_ranking_raw(property_id, site_url, days):
     except Exception:
         pass
 
-    # Step 3. Search Console APIから検索キーワードを取得
     kw_map, sc_error = get_search_console_keywords(site_url, days)
 
-    # Step 4. 前期PV
     prev_pv_map = {}
     try:
         req_prev = RunReportRequest(
@@ -277,7 +275,6 @@ def get_article_ranking_raw(property_id, site_url, days):
     except Exception:
         pass
 
-    # 結合・集計処理
     df_final = df_base.groupby("title").agg({"pv": "sum", "path": "first"}).reset_index()
     df_final["前期のPV"] = df_final["title"].map(prev_pv_map).fillna(0).astype(int)
     df_final["差分"] = df_final["pv"] - df_final["前期のPV"]
@@ -288,21 +285,25 @@ def get_article_ranking_raw(property_id, site_url, days):
         else: return "0%"
     df_final["前期間比"] = df_final.apply(calc_pct, axis=1)
 
-    def resolve_info(row):
+    # ★列を分ける処理
+    def resolve_kw(row):
         path = str(row["path"]).split('?')[0]
-        title = row["title"]
-        # キーワードがあれば優先表示、なければ流入元
         if path in kw_map and kw_map[path]:
-            return f"🔑 {kw_map[path]}"
-        elif title in source_map:
+            return kw_map[path]
+        return "-"
+        
+    def resolve_source(row):
+        title = row["title"]
+        if title in source_map:
             return source_map[title]
         return "-"
 
-    df_final["検索キーワード / 主な流入元"] = df_final.apply(resolve_info, axis=1)
+    df_final["検索キーワード"] = df_final.apply(resolve_kw, axis=1)
+    df_final["主な流入元"] = df_final.apply(resolve_source, axis=1)
     
-    # ★TOP50に変更
     final = df_final.sort_values("pv", ascending=False).head(50)
-    final = final[["title", "pv", "前期のPV", "前期間比", "検索キーワード / 主な流入元"]]
+    # ★表示する列の順番を指定
+    final = final[["title", "pv", "前期のPV", "前期間比", "検索キーワード", "主な流入元"]]
     final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
     return final, sc_error
 
@@ -371,7 +372,6 @@ with tab2:
     st.markdown("### 📈 期間比較レポート")
     col_sel, _ = st.columns([1, 2])
     with col_sel:
-        # ★ 3, 7, 14, 30 から選べるように変更
         period_days = st.selectbox("分析期間", [3, 7, 14, 30], index=3, format_func=lambda x: f"過去 {x} 日間")
     
     for blog in BLOGS:
@@ -385,10 +385,8 @@ with tab2:
                     st.line_chart(df_trend, color=["#FF4B4B", "#CCCCCC"]) 
                     st.caption("赤線: 今期 / グレー線: 前期")
                 
-                # ★ ランキング取得 (sc_errorも受け取る)
                 df_top, sc_error = get_article_ranking_raw(blog["id"], blog["url"], period_days)
                 
-                # キーワード取得に関するエラーを検知した場合に警告を表示
                 if sc_error:
                     if "モジュール不足" in sc_error:
                         st.warning("⚠️ **キーワードを表示するための準備が必要です**\n\nGitHubの `requirements.txt` を開き、一番下に `google-api-python-client` と追記して保存してください。")
@@ -397,7 +395,19 @@ with tab2:
                 
                 if not df_top.empty:
                     st.markdown("#### 🏆 記事別ランキング TOP50")
-                    st.dataframe(df_top, use_container_width=True, hide_index=True, height=800)
+                    
+                    # ★横スクロール可能にするため、カラム幅を設定しコンテナ幅を固定しない
+                    st.dataframe(
+                        df_top, 
+                        column_config={
+                            "記事タイトル": st.column_config.TextColumn("記事タイトル", width="medium"),
+                            "検索キーワード": st.column_config.TextColumn("検索キーワード", width="large"),
+                            "主な流入元": st.column_config.TextColumn("主な流入元", width="medium"),
+                        },
+                        use_container_width=False,  # ここをFalseにすることで表が横に伸びてスクロールバーが出る
+                        hide_index=True, 
+                        height=800
+                    )
                 else:
                     st.warning("データなし")
             except Exception as e:

@@ -2,3 +2,4 @@ streamlit
 google-analytics-data>=0.17.0
 pandas
 pytz
+google-api-python-client

@@ -11,6 +11,7 @@ import pytz
 import pandas as pd
 import urllib.parse
 import re
+import io
 
 # =========================================================
 #  0. ページ設定 & パスワード認証
@@ -202,7 +203,7 @@ def get_search_console_keywords(site_url, days):
         return {}, str(e)
 
 
-# ★ 新規追加：モバイル検索に限定して、検索順位（ポジション）を取得する関数
+# モバイル検索に限定して、検索順位（ポジション）を取得する関数
 @st.cache_data(ttl=3600)
 def get_mobile_search_ranking(site_url, days):
     try:
@@ -216,7 +217,6 @@ def get_mobile_search_ranking(site_url, days):
         end_date = (datetime.now(JST) - timedelta(days=1)).strftime('%Y-%m-%d')
         start_date = (datetime.now(JST) - timedelta(days=days+1)).strftime('%Y-%m-%d')
         
-        # device = MOBILE でフィルタリング
         request = {
             'startDate': start_date,
             'endDate': end_date,
@@ -240,7 +240,7 @@ def get_mobile_search_ranking(site_url, days):
             page_url = row['keys'][0]
             query = row['keys'][1]
             clicks = row['clicks']
-            position = row['position'] # ★順位を取得
+            position = row['position']
             
             if clicks > 0:
                 if page_url not in kw_map:
@@ -251,7 +251,7 @@ def get_mobile_search_ranking(site_url, days):
         for page_url, kws in kw_map.items():
             path = urllib.parse.urlparse(page_url).path
             kws_sorted = sorted(kws, key=lambda x: x['clicks'], reverse=True)
-            final_map[path] = kws_sorted[:3] # 上位3キーワードのみ抽出
+            final_map[path] = kws_sorted[:3]
             
         return final_map, None 
     
@@ -372,7 +372,6 @@ def get_article_ranking_raw(property_id, site_url, days):
     df_final["主な流入元"] = df_final.apply(resolve_source, axis=1)
     
     final = df_final.sort_values("pv", ascending=False).head(50)
-    # ★ 順位分析でパスを使うため "path" も残す
     final = final[["title", "path", "pv", "前期のPV", "前期間比", "上昇推移", "下落推移", "検索キーワード", "主な流入元"]]
     final = final.rename(columns={"title": "記事タイトル", "pv": "今期のPV"})
     return final, sc_error, trend_map
@@ -416,18 +415,102 @@ def get_sns_traffic_safe(property_id, domain, days=7):
             
     return pd.DataFrame(data)
 
+# ★ 新規追加：全記事・全期間の下落分析レポートを取得する関数
+@st.cache_data(ttl=3600)
+def get_comprehensive_decline_report(property_id):
+    # 比較する7つの期間を定義
+    periods = [
+        {"key": "昨日", "curr_start": "yesterday", "curr_end": "yesterday", "prev_start": "2daysAgo", "prev_end": "2daysAgo"},
+        {"key": "1週間", "curr_start": "7daysAgo", "curr_end": "today", "prev_start": "15daysAgo", "prev_end": "8daysAgo"},
+        {"key": "2週間", "curr_start": "14daysAgo", "curr_end": "today", "prev_start": "29daysAgo", "prev_end": "15daysAgo"},
+        {"key": "1か月", "curr_start": "30daysAgo", "curr_end": "today", "prev_start": "61daysAgo", "prev_end": "31daysAgo"},
+        {"key": "3か月", "curr_start": "90daysAgo", "curr_end": "today", "prev_start": "181daysAgo", "prev_end": "91daysAgo"},
+        {"key": "6か月", "curr_start": "180daysAgo", "curr_end": "today", "prev_start": "361daysAgo", "prev_end": "181daysAgo"},
+        {"key": "1年", "curr_start": "365daysAgo", "curr_end": "today", "prev_start": "731daysAgo", "prev_end": "366daysAgo"}
+    ]
+    
+    article_map = {}
+    
+    for p in periods:
+        k = p["key"]
+        
+        # 今期データ取得
+        try:
+            req_curr = RunReportRequest(
+                property=f"properties/{property_id}",
+                date_ranges=[DateRange(start_date=p["curr_start"], end_date=p["curr_end"])],
+                dimensions=[Dimension(name="pagePath"), Dimension(name="pageTitle")],
+                metrics=[Metric(name="screenPageViews")],
+                limit=100000
+            )
+            res_curr = client.run_report(req_curr)
+            if res_curr.rows:
+                for row in res_curr.rows:
+                    path = row.dimension_values[0].value
+                    title = row.dimension_values[1].value
+                    pv = int(row.metric_values[0].value)
+                    
+                    if path not in article_map:
+                        article_map[path] = {"URL(Path)": path, "記事タイトル": title}
+                    article_map[path][f"{k}_今期PV"] = pv
+        except Exception:
+            pass
+            
+        # 前期データ取得
+        try:
+            req_prev = RunReportRequest(
+                property=f"properties/{property_id}",
+                date_ranges=[DateRange(start_date=p["prev_start"], end_date=p["prev_end"])],
+                dimensions=[Dimension(name="pagePath")],
+                metrics=[Metric(name="screenPageViews")],
+                limit=100000
+            )
+            res_prev = client.run_report(req_prev)
+            if res_prev.rows:
+                for row in res_prev.rows:
+                    path = row.dimension_values[0].value
+                    pv = int(row.metric_values[0].value)
+                    
+                    if path not in article_map:
+                        article_map[path] = {"URL(Path)": path, "記事タイトル": "不明"}
+                    article_map[path][f"{k}_前期PV"] = pv
+        except Exception:
+            pass
+            
+    df_list = []
+    for path, data in article_map.items():
+        row_data = {"記事タイトル": data.get("記事タイトル", ""), "URL(Path)": path}
+        # 各期間のデータを辞書にセット
+        for p in periods:
+            k = p["key"]
+            curr = data.get(f"{k}_今期PV", 0)
+            prev = data.get(f"{k}_前期PV", 0)
+            diff = curr - prev
+            
+            row_data[f"{k} 今期"] = curr
+            row_data[f"{k} 前期"] = prev
+            row_data[f"{k} 増減"] = diff
+            
+        df_list.append(row_data)
+        
+    df = pd.DataFrame(df_list)
+    # 下落分析が目的のため、「直近1か月の増減」がマイナス（落ち込みが大きい）順にソート
+    if not df.empty:
+        df = df.sort_values("1か月 増減", ascending=True)
+        
+    return df
+
 
 # ---------------------------------------------------------
 # 4. 画面表示
 # ---------------------------------------------------------
 st.write(f"最終更新: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ★ 期間選択をタブの上に移動（レポートと順位分析で連動）
 col_sel, _ = st.columns([1, 4])
 with col_sel:
     period_days = st.selectbox("📅 分析期間 (レポート・順位分析用)", [3, 7, 14, 30], index=3, format_func=lambda x: f"過去 {x} 日間")
 
-tab1, tab2, tab3, tab4 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入", "🔍 検索順位・競合分析"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["⏱️ リアルタイムPV", "📈 期間分析レポート", "📱 SNSでの言及・流入", "🔍 検索順位・競合分析", "📉 アクセス下落分析"])
 
 with tab1:
     cols = st.columns(3)
@@ -478,19 +561,15 @@ with tab2:
                     st.caption("※ 上位50記事の推移です。グラフ上の凡例をダブルクリックすると特定の記事だけを表示できます。")
 
                 if sc_error:
-                    if "モジュール不足" in sc_error:
-                        st.warning("⚠️ **キーワード表示の準備が必要です**\n\nGitHubの `requirements.txt` に `google-api-python-client` と追記してください。")
-                    elif "403" in sc_error or "Permission denied" in sc_error:
-                        st.warning(f"⚠️ **サーチコンソールとの連携が未完了です**\n\nGSCの「ユーザーと権限」で、GA4連携用アドレスを「閲覧者」に追加してください。")
+                    st.warning("サーチコンソール連携エラーが発生しています。")
                 
                 if not df_top.empty:
                     st.markdown("#### 🏆 記事別ランキング TOP50")
-                    
                     st.dataframe(
                         df_top, 
                         column_config={
                             "記事タイトル": st.column_config.TextColumn("記事タイトル", width="medium"),
-                            "path": None, # ★ path列は裏で持っておき、表示は隠す
+                            "path": None, 
                             "上昇推移": st.column_config.LineChartColumn("上昇 📈", y_min=0, color="#FF4B4B"),
                             "下落推移": st.column_config.LineChartColumn("下落 📉", y_min=0, color="#1E88E5"),
                             "検索キーワード": st.column_config.TextColumn("検索キーワード", width="large"),
@@ -531,17 +610,12 @@ with tab3:
                 c1.link_button("X(Twitter)反応", f"https://search.yahoo.co.jp/realtime/search?p={q}")
                 c2.link_button("SNS全体Google検索", f"https://www.google.com/search?q=site:x.com+{q}+OR+site:facebook.com+{q}")
 
-# ★ 新規追加タブ：検索順位・競合分析
 with tab4:
     st.markdown("### 🔍 検索順位・競合分析（モバイル検索）")
-    st.info("💡 **データの取得方法について:** \nプログラムから直接Google検索を大量に行うと、Googleから即座にIPブロック（スパム判定）を受けてしまいます。そのため、最も安全で正確な **Google Search Consoleの実データ（実際のモバイル検索での平均掲載順位）** を利用しています。")
-    
     for blog in BLOGS:
         with st.expander(f"🏆 {blog['name']} - 流入上位キーワードの検索順位", expanded=True):
             try:
-                # 期間分析と同じTOP50のデータを取得
                 df_top, _, _ = get_article_ranking_raw(blog["id"], blog["url"], period_days)
-                # モバイル検索の順位付きキーワードデータを取得
                 mobile_kw_map, m_error = get_mobile_search_ranking(blog["url"], period_days)
                 
                 if m_error:
@@ -549,13 +623,11 @@ with tab4:
                 
                 if not df_top.empty:
                     rank_list = []
-                    # TOP50記事についてループ
                     for i, row in df_top.iterrows():
                         title = row["記事タイトル"]
                         path = str(row["path"]).split('?')[0]
                         pv = row["今期のPV"]
                         
-                        # 該当記事のキーワードリストを取得
                         kws = mobile_kw_map.get(path, [])
                         kw1 = kws[0] if len(kws) > 0 else None
                         kw2 = kws[1] if len(kws) > 1 else None
@@ -564,7 +636,6 @@ with tab4:
                         def format_kw(k):
                             if not k: return "-"
                             pos = round(k["position"], 1)
-                            # 50位までを表示、それ以降は「50位圏外」
                             pos_str = f"{pos}位" if pos <= 50 else "50位圏外"
                             return f"{k['query']} ({pos_str})"
 
@@ -577,8 +648,6 @@ with tab4:
                         })
                     
                     df_rank = pd.DataFrame(rank_list)
-                    
-                    # 検索順位の表を表示
                     st.dataframe(
                         df_rank,
                         column_config={
@@ -596,3 +665,31 @@ with tab4:
                     st.warning("データがありません")
             except Exception as e:
                 st.error(f"エラー: {e}")
+
+# ★ 新規追加タブ：全記事アクセス下落分析
+with tab5:
+    st.markdown("### 📉 全記事アクセス推移・下落分析レポート")
+    st.info("💡 **全記事**について、「昨日」「1週間」「2週間」「1ヶ月」「3ヶ月」「6ヶ月」「1年」のそれぞれのアクセス推移と前期比較を一括抽出し、アクセスが落ちている記事を特定します。（※API通信を複数回行うため、取得に少し時間がかかります）")
+    
+    selected_blog = st.selectbox("分析するブログを選択", [b["name"] for b in BLOGS])
+    blog_info = next((b for b in BLOGS if b["name"] == selected_blog), None)
+    
+    if st.button("詳細レポートを生成する（CSV出力可）", type="primary"):
+        with st.spinner("GA4から全期間のデータを抽出しています...（数分かかる場合があります）"):
+            df_decline = get_comprehensive_decline_report(blog_info["id"])
+            
+            if not df_decline.empty:
+                st.success("レポートの生成が完了しました！ **「直近1ヶ月」でアクセス下落幅が大きい記事から順番に** 表示しています。")
+                
+                # 日本語が文字化けしないよう utf-8-sig でエンコードしてCSV化
+                csv = df_decline.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    label="📥 CSVをダウンロードしてExcelで詳細分析",
+                    data=csv,
+                    file_name=f"decline_report_{blog_info['url']}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                )
+                
+                st.dataframe(df_decline, use_container_width=True, hide_index=True, height=800)
+            else:
+                st.warning("データが取得できませんでした。")

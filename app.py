@@ -466,7 +466,7 @@ def get_comprehensive_decline_report(property_id):
         df = df.sort_values("1か月 増減", ascending=True)
     return df
 
-# ★ 新規追加：タイトル・コンテンツ改善データ取得関数
+# タイトル改善
 @st.cache_data(ttl=3600)
 def get_improvement_data(property_id, site_url, days):
     ga4_data = {}
@@ -533,9 +533,7 @@ def get_improvement_data(property_id, site_url, days):
         if g_val["pv"] < 10: continue
         s_val = gsc_data.get(path, {"impressions": 0, "clicks": 0, "ctr": 0, "position": 0})
         
-        # タイトル改善判定：表示回数100回以上かつCTR2%未満
         title_alert = "⚠️改善" if s_val["impressions"] > 100 and s_val["ctr"] < 0.02 else "OK"
-        # リライト判定：PV50以上かつ平均滞在時間30秒未満
         content_alert = "⚠️リライト" if g_val["pv"] > 50 and g_val["duration"] < 30 else "OK"
 
         result.append({
@@ -556,7 +554,6 @@ def get_improvement_data(property_id, site_url, days):
         df = df.sort_values("GSC_表示回数", ascending=False)
     return df
 
-# ★ 新規追加：特定記事のクエリ詳細取得関数
 @st.cache_data(ttl=3600)
 def get_gsc_queries_for_page(site_url, page_path, days):
     try:
@@ -604,6 +601,129 @@ def get_gsc_queries_for_page(site_url, page_path, days):
     except Exception as e:
         return pd.DataFrame()
 
+# ★ 新規追加：順位低下＆アクセス減に基づくリライト提案ロジック
+@st.cache_data(ttl=3600)
+def get_rewrite_proposals(property_id, site_url, days):
+    curr_start = f"{days}daysAgo"
+    curr_end = "yesterday"
+    prev_start = f"{days*2}daysAgo"
+    prev_end = f"{days+1}daysAgo"
+
+    # GA4 今期PV
+    ga4_curr = {}
+    try:
+        req = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=curr_start, end_date=curr_end)],
+            dimensions=[Dimension(name="pagePath"), Dimension(name="pageTitle")],
+            metrics=[Metric(name="screenPageViews")],
+            limit=10000
+        )
+        res = client.run_report(req)
+        for row in res.rows:
+            p = row.dimension_values[0].value.split('?')[0]
+            t = row.dimension_values[1].value
+            pv = int(row.metric_values[0].value)
+            ga4_curr[p] = {"title": t, "pv_curr": pv}
+    except Exception: pass
+
+    # GA4 前期PV
+    ga4_prev = {}
+    try:
+        req = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=prev_start, end_date=prev_end)],
+            dimensions=[Dimension(name="pagePath")],
+            metrics=[Metric(name="screenPageViews")],
+            limit=10000
+        )
+        res = client.run_report(req)
+        for row in res.rows:
+            p = row.dimension_values[0].value.split('?')[0]
+            pv = int(row.metric_values[0].value)
+            ga4_prev[p] = pv
+    except Exception: pass
+
+    # GSC データ取得用ヘルパー
+    def fetch_gsc(start_dt, end_dt):
+        try:
+            creds_json = json.loads(st.secrets["gcp_service_account"])
+            sc_creds = service_account.Credentials.from_service_account_info(
+                creds_json, scopes=['https://www.googleapis.com/auth/webmasters.readonly']
+            )
+            sc_service = build('searchconsole', 'v1', credentials=sc_creds)
+            req_body = {'startDate': start_dt, 'endDate': end_dt, 'dimensions': ['page'], 'rowLimit': 10000}
+            try:
+                res = sc_service.searchanalytics().query(siteUrl=f"sc-domain:{site_url}", body=req_body).execute()
+            except:
+                res = sc_service.searchanalytics().query(siteUrl=f"https://{site_url}/", body=req_body).execute()
+            
+            data = {}
+            for row in res.get('rows', []):
+                url = row['keys'][0]
+                path = urllib.parse.urlparse(url).path
+                data[path] = {"pos": row["position"], "clicks": row["clicks"]}
+            return data
+        except:
+            return {}
+
+    now_j = datetime.now(JST)
+    c_end_dt = (now_j - timedelta(days=1)).strftime('%Y-%m-%d')
+    c_start_dt = (now_j - timedelta(days=days)).strftime('%Y-%m-%d')
+    p_end_dt = (now_j - timedelta(days=days+1)).strftime('%Y-%m-%d')
+    p_start_dt = (now_j - timedelta(days=days*2)).strftime('%Y-%m-%d')
+
+    gsc_curr = fetch_gsc(c_start_dt, c_end_dt)
+    gsc_prev = fetch_gsc(p_start_dt, p_end_dt)
+
+    result = []
+    for path, curr_val in ga4_curr.items():
+        title = curr_val["title"]
+        pv_c = curr_val["pv_curr"]
+        pv_p = ga4_prev.get(path, 0)
+        
+        gc = gsc_curr.get(path, {"pos": 0.0})
+        gp = gsc_prev.get(path, {"pos": 0.0})
+        pos_c = gc["pos"]
+        pos_p = gp["pos"]
+        
+        # 最低限のトラフィックがない記事は除外
+        if pv_p < 20 and pos_p == 0: continue
+        
+        pv_diff = pv_c - pv_p
+        # 順位変動: 数値が大きくなる＝順位が落ちている
+        pos_diff = pos_c - pos_p if pos_p > 0 and pos_c > 0 else 0
+        
+        reason = []
+        if pos_diff >= 2.0: # 順位が2位以上ダウン
+            reason.append(f"順位低下 (▼{pos_diff:.1f})")
+        if pv_diff <= -20 or (pv_p > 0 and pv_diff/pv_p <= -0.2): # PVが20以上減、または20%以上減
+            reason.append(f"アクセス減 (▼{abs(pv_diff)})")
+            
+        priority = ""
+        if len(reason) == 2: priority = "🚨 最優先"
+        elif len(reason) == 1: priority = "⚠️ 要検討"
+        else: priority = "✅ 安定"
+            
+        if priority != "✅ 安定":
+            result.append({
+                "優先度": priority,
+                "低下要因": " ＋ ".join(reason),
+                "記事タイトル": title,
+                "今期PV": pv_c,
+                "前期PV": pv_p,
+                "今期平均順位": round(pos_c, 1) if pos_c > 0 else "-",
+                "前期平均順位": round(pos_p, 1) if pos_p > 0 else "-",
+                "URL(Path)": path
+            })
+
+    df = pd.DataFrame(result)
+    if not df.empty:
+        df["sort_val"] = df["優先度"].apply(lambda x: 1 if "最優先" in x else 2)
+        df = df.sort_values(["sort_val", "前期PV"], ascending=[True, False]).drop(columns=["sort_val"])
+        
+    return df
+
 
 # ---------------------------------------------------------
 # 4. 画面表示
@@ -614,13 +734,15 @@ col_sel, _ = st.columns([1, 4])
 with col_sel:
     period_days = st.selectbox("📅 分析期間", [3, 7, 14, 30], index=3, format_func=lambda x: f"過去 {x} 日間")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+# ★ タブを7つに変更
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "⏱️ リアルタイムPV", 
     "📈 期間分析レポート", 
     "📱 SNS流入", 
     "🔍 検索順位", 
     "📉 アクセス下落分析",
-    "🛠️ タイトル・コンテンツ改善"
+    "🛠️ タイトル・コンテンツ改善",
+    "📝 リライト提案・順位低下"
 ])
 
 with tab1:
@@ -734,11 +856,8 @@ with tab5:
                 st.download_button("📥 CSVをダウンロード", data=csv, file_name=f"decline_{blog_info['url']}.csv", mime="text/csv")
                 st.dataframe(df_decline, use_container_width=True, hide_index=True, height=800)
 
-# ★ 新規追加タブ：改善・ギャップ分析
 with tab6:
     st.markdown("### 🛠️ タイトル・コンテンツ改善分析")
-    st.info("💡 **GSCのCTR**と**GA4の滞在時間**から改善が必要な記事を抽出し、競合サイトとのギャップ分析をサポートします。")
-    
     selected_blog_t6 = st.selectbox("分析するブログを選択", [b["name"] for b in BLOGS], key="tab6_blog")
     blog_info_t6 = next(b for b in BLOGS if b["name"] == selected_blog_t6)
     
@@ -753,10 +872,7 @@ with tab6:
         if not df_improve.empty:
             st.dataframe(
                 df_improve,
-                column_config={
-                    "記事タイトル": st.column_config.TextColumn(width="medium"),
-                    "URL(Path)": None,
-                },
+                column_config={"記事タイトル": st.column_config.TextColumn(width="medium"), "URL(Path)": None},
                 use_container_width=True, hide_index=True, height=600
             )
         else:
@@ -765,7 +881,6 @@ with tab6:
     with sub2:
         st.markdown("#### 🔎 特定記事の検索意図ズレ ＆ コンテンツギャップ分析")
         if not df_improve.empty:
-            # 記事選択用にタイトルとパスの辞書作成
             title_to_path = {f"{row['記事タイトル']} (PV:{row['GA4_PV']})": row['URL(Path)'] for _, row in df_improve.head(100).iterrows()}
             selected_title = st.selectbox("分析する記事を選択（PV上位100件から）", list(title_to_path.keys()))
             target_path = title_to_path[selected_title]
@@ -775,29 +890,35 @@ with tab6:
             
             if not df_queries.empty:
                 st.markdown(f"**「{selected_title}」の流入クエリ一覧**")
-                st.dataframe(
-                    df_queries,
-                    column_config={
-                        "競合比較リンク": st.column_config.LinkColumn("Googleで競合サイトを確認", display_text="検索する 🔎")
-                    },
-                    use_container_width=True, hide_index=True
-                )
-                
-                st.markdown("---")
-                st.markdown("### 📝 競合ギャップ＆一次情報チェックリスト")
-                st.warning("上記の表で**「表示回数が多いのに順位が低い(10位以下)」「CTRが極端に低い」**キーワードは、読者の検索意図と記事がズレている可能性が高いです。横の「検索する 🔎」ボタンを押して、上位サイトと自分の記事を比較してください。")
-                
-                col_c1, col_c2 = st.columns(2)
-                with col_c1:
-                    st.success("**🔎 検索意図とコンテンツギャップの確認**")
-                    st.checkbox("自分のタイトルは、上位のサイトと比べてクリックしたくなる魅力があるか？")
-                    st.checkbox("上位サイトの見出し（H2, H3）にあって、自分の記事に欠けている情報はないか？")
-                    st.checkbox("検索ユーザーが一番知りたかった「答え」が、記事の冒頭（リード文）に書かれているか？")
-                with col_c2:
-                    st.info("**💡 一次情報（独自性）の確認**")
-                    st.checkbox("単なる情報のまとめ（上位サイトの焼き直し）になっていないか？")
-                    st.checkbox("筆者自身の実際の体験談、失敗談、独自の写真やデータが含まれているか？")
-                    st.checkbox("AIや他の人が簡単に書けない「専門的な視点・感情・レビュー」が入っているか？")
-                    
+                st.dataframe(df_queries, column_config={"競合比較リンク": st.column_config.LinkColumn("Googleで競合を確認", display_text="検索する 🔎")}, use_container_width=True, hide_index=True)
             else:
                 st.warning("この記事の検索クエリデータはまだありません。")
+
+# ★ 新規追加タブ：リライト提案・順位低下アラート
+with tab7:
+    st.markdown("### 📝 リライト提案・順位低下アラート")
+    st.info("💡 **「前期と比較して検索順位が2位以上落ちた記事」**や**「PVが大きく落ちた記事」**を自動抽出し、テコ入れすべき対象をリストアップします。")
+    
+    selected_blog_t7 = st.selectbox("分析するブログを選択", [b["name"] for b in BLOGS], key="tab7_blog")
+    blog_info_t7 = next(b for b in BLOGS if b["name"] == selected_blog_t7)
+    
+    if st.button("🚨 リライト対象記事を抽出する", type="primary"):
+        with st.spinner(f"GA4とSearch Consoleのデータを照合しています...（過去 {period_days} 日間 vs その前の {period_days} 日間）"):
+            df_rewrite = get_rewrite_proposals(blog_info_t7["id"], blog_info_t7["url"], period_days)
+            
+            if not df_rewrite.empty:
+                st.success("抽出完了！「順位低下」と「アクセス減」の両方が起きている記事は『🚨最優先』として上に表示されます。")
+                st.dataframe(
+                    df_rewrite,
+                    column_config={
+                        "優先度": st.column_config.TextColumn("優先度", width="small"),
+                        "低下要因": st.column_config.TextColumn("低下要因", width="medium"),
+                        "記事タイトル": st.column_config.TextColumn("記事タイトル", width="medium"),
+                        "URL(Path)": None # 表示上は隠す
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    height=800
+                )
+            else:
+                st.success("素晴らしい！直近で大きく順位やアクセスを落としている記事は見つかりませんでした。")
